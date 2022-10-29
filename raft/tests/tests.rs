@@ -47,14 +47,14 @@ impl Cluster {
         let to = self
             .nodes
             .iter_mut()
-            .find(|n| n.id == msg.to)
+            .find(|n| n.id() == msg.to)
             .expect(format!("node with id {} doesn't exist", msg.to).as_str());
         
-        to.step(msg)
+        to.step(&msg)
     }
 
     fn has_leader(&self) -> bool {
-        self.nodes.iter().any(|n| n.state == NodeState::LEADER)
+        self.nodes.iter().any(|n| n.state() == NodeState::LEADER)
     }
 }
 
@@ -66,9 +66,9 @@ fn new_default_cfg(id: NodeId) -> Config {
             .into_iter()
             .filter(|peer_id| id == *peer_id)
             .collect(),
-        electionTickCount: 10,
-        electionTickRand: (0, 20),
-        heartbeatTickCount: 10,
+        election_tick_timeout: 20,
+        heartbeat_tick_timeout: 2,
+        ..Default::default()
     }
 }
 
