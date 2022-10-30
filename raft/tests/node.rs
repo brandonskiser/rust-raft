@@ -9,7 +9,7 @@ fn test_cfg() -> Config {
     Config {
         peers: (1..CLUSTER_SIZE).collect(),
         election_tick_timeout: ELECTION_TIMEOUT,
-        election_tick_rand: Some((0, 0)),
+        election_tick_rand: 0,
         heartbeat_tick_timeout: HEARTBEAT_TIMEOUT,
         ..Default::default()
     }
@@ -34,8 +34,12 @@ fn make_candidate_node() -> (Node, Ready) {
 }
 
 fn assert_election_started(node: &Node, rdy: &Ready, term: u32) {
-    assert_eq!(node.state(), NodeState::CANDIDATE);
-    assert_eq!(rdy.messages.len(), 2);
+    assert_eq!(
+        node.state(),
+        NodeState::CANDIDATE,
+        "Expected node to be CANDIDATE"
+    );
+    assert_eq!(rdy.messages.len() as u32, CLUSTER_SIZE - 1);
     for (i, m) in rdy.messages.iter().enumerate() {
         assert_eq!(
             m.body(),
@@ -48,6 +52,8 @@ fn assert_election_started(node: &Node, rdy: &Ready, term: u32) {
                 })
             }
         );
+        assert_eq!(m.from(), 0);
+        assert_eq!(m.to(), i as u32 + 1);
     }
 }
 
@@ -103,9 +109,10 @@ fn new_candidate_starts_election_after_timeout() {
 fn candidate_ignores_vote_from_previous_election() {
     let (mut node, rdy) = make_candidate_node();
 
-    // Timeout, and start new election.
+    // Timeout, and start a second election.
     tick_for(&mut node, ELECTION_TIMEOUT);
 
+    // Create peer responses from the first election.
     let resps = rdy
         .messages
         .iter()
@@ -117,7 +124,7 @@ fn candidate_ignores_vote_from_previous_election() {
                 },
                 MessageMetadata {
                     rpc_id: m.metadata().rpc_id,
-                    from: m.from(),
+                    from: m.to(),
                     to: 0,
                 },
             )
@@ -221,7 +228,7 @@ fn candidate_with_quorum_becomes_leader() {
                 },
                 MessageMetadata {
                     rpc_id: m.metadata().rpc_id,
-                    from: m.from(),
+                    from: m.to(),
                     to: 0,
                 },
             )

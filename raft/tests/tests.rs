@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::fmt::Debug;
 
 use raft::message::*;
 use raft::*;
@@ -13,13 +14,15 @@ impl Cluster {
     }
 
     /// Return true if cluster has a leader, false if timed out.
-    fn tick_while_no_leader(&mut self, tick_timeout: u32) -> bool {
+    fn tick_while_no_leader(&mut self, tick_timeout: u32) -> (bool, Vec<impl IntoIterator + Debug>) {
         let mut ticks = 0;
+        let mut state_history: Vec<Vec<NodeState>> = vec![];
         while ticks < tick_timeout && !self.has_leader() {
             self.tick_all();
             ticks += 1;
+            state_history.push(self.nodes.iter().map(|n| n.state()).collect());
         }
-        self.has_leader()
+        (self.has_leader(), state_history)
     }
 
     fn tick_all(&mut self) {
@@ -28,6 +31,7 @@ impl Cluster {
             .iter_mut()
             .filter_map(|n| n.tick())
             .collect::<Vec<_>>();
+        println!("tick_all got rdys: {:?}", rdys);
         self.handle_readys(rdys.into_iter());
     }
 
@@ -36,7 +40,9 @@ impl Cluster {
         let mut queue = rdys.flat_map(|r| r.messages).collect::<VecDeque<_>>();
 
         while let Some(msg) = queue.pop_front() {
+            println!("Sending message: {:?}", msg);
             if let Some(rdy) = self.send_msg(msg) {
+                println!("Post message rdy: {:?}", rdy);
                 for m in rdy.messages {
                     queue.push_back(m);
                 }
@@ -65,10 +71,10 @@ fn new_default_cfg(id: NodeId) -> Config {
         id,
         peers: vec![1, 2, 3]
             .into_iter()
-            .filter(|peer_id| id == *peer_id)
+            .filter(|peer_id| id != *peer_id)
             .collect(),
-        election_tick_timeout: 20,
-        heartbeat_tick_timeout: 2,
+        // election_tick_timeout: 20,
+        // heartbeat_tick_timeout: 2,
         ..Default::default()
     }
 }
@@ -79,12 +85,17 @@ fn new_test_cluster() -> Cluster {
         .map(|id| Node::new(new_default_cfg(id)))
         .collect::<Vec<Node>>();
 
+    println!("Created test cluster: {:?}", nodes);
     Cluster::new(nodes)
 }
 
 #[test]
 fn new_cluster_will_select_leader() {
     let mut cluster = new_test_cluster();
-    let has_leader = cluster.tick_while_no_leader(100);
-    assert!(has_leader)
+    let (has_leader, history) = cluster.tick_while_no_leader(100);
+    assert!(
+        has_leader,
+        "Expected cluster to have leader. History: {:?}",
+        history
+    )
 }

@@ -1,6 +1,8 @@
+use std::fmt::Debug;
+
 use crate::Entry;
 
-pub trait Storage {
+pub trait Storage: Debug {
     /// Returns the term of the entry at the given index, returning `None` if no
     /// entry exists.
     fn term(&self, index: u32) -> Option<u32>;
@@ -12,6 +14,7 @@ pub trait Storage {
     fn last_index(&self) -> u32;
 }
 
+#[derive(Debug)]
 pub struct MemoryStorage {
     log: Vec<Entry>,
 }

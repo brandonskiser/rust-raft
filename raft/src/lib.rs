@@ -1,7 +1,12 @@
 pub mod message;
 pub mod storage;
 
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    num::NonZeroU32,
+};
+
+// use rand;
 
 use message::*;
 use storage::*;
@@ -15,10 +20,10 @@ pub struct Config {
     /// The number of ticks that must pass until a node starts an election.
     pub election_tick_timeout: u32,
 
-    /// TODO: decide on this name/behavior. This should probably default to a number
-    /// [0, electionTickTimeout - 1] so that the actual election timeout will be
-    /// [electionTickTimeout, 2 * electionTickTimeout - 1] like in etcd Raft.
-    pub election_tick_rand: Option<(u32, u32)>,
+    /// The highest number that will be randomly added to election_tick_timeout per
+    /// timeout cycle. Defaults to election_tick_timeout - 1, thus the actual election_tick_timeout
+    /// will be a value in the range [election_tick_timeout, 2 * election_tick_timeout - 1]
+    pub election_tick_rand: u32,
 
     /// The number of ticks that must pass until a leader sends a heartbeat message.
     pub heartbeat_tick_timeout: u32,
@@ -31,7 +36,7 @@ impl Default for Config {
             peers: vec![],
             storage: Box::new(MemoryStorage::new()),
             election_tick_timeout: 10,
-            election_tick_rand: None,
+            election_tick_rand: 9,
             heartbeat_tick_timeout: 1,
         }
     }
@@ -44,22 +49,36 @@ pub enum NodeState {
     LEADER,
 }
 
+#[derive(Debug)]
 struct MsgStore {
+    /// Term for which this message store is valid.
     term: u32,
 
-    /// Map
+    /// Map of peer id's to rpc_id's.
     sent: HashMap<NodeId, u32>,
 }
 
 impl MsgStore {
-    fn insert(&mut self, term: u32, msg: &Message) {
-        if term > self.term {
-            self.sent.clear();
+    fn new() -> Self {
+        Self {
+            term: 0,
+            sent: HashMap::new(),
         }
-        self.sent.insert(msg.to(), msg.metadata().rpc_id);
     }
 
-    fn matches(&self, term: u32, msg: &Message) -> bool {
+    fn insert(&mut self, term: u32, msg: &mut Message) -> u32 {
+        if term > self.term {
+            self.term = term;
+            self.sent.clear();
+        }
+        // For now, just use a random id.
+        let rpc_id = rand::random();
+        msg.set_rpc_id(rpc_id);
+        self.sent.insert(msg.to(), msg.metadata().rpc_id);
+        rpc_id
+    }
+
+    fn matches(&self, msg: &Message) -> bool {
         if let Some(rpc_id) = self.sent.get(&msg.from()) {
             *rpc_id == msg.metadata().rpc_id
         } else {
@@ -117,7 +136,7 @@ impl ReadyBuilder {
                 variant: resp,
             },
             MessageMetadata {
-                rpc_id: 0,
+                rpc_id: m.metadata().rpc_id,
                 from: raft.id,
                 to: m.from(),
             },
@@ -148,6 +167,7 @@ pub struct Entry {
     pub data: Vec<u8>,
 }
 
+#[derive(Debug)]
 struct Election {
     term: u32,
     responded_peers: HashSet<NodeId>,
@@ -178,39 +198,17 @@ impl Election {
 }
 
 /// Represents a single node participating in a Raft cluster.
+#[derive(Debug)]
 pub struct Node {
     raft: Raft,
-    // msg_store: MsgStore,
 }
 
 impl Node {
     pub fn new(cfg: Config) -> Self {
         // TODO: validate cfg
-        let raft = Raft {
-            id: cfg.id,
-            state: NodeState::FOLLOWER,
-            peers: cfg.peers,
-            storage: cfg.storage,
-
-            current_term: 0,
-            voted_for: None,
-            election: None,
-            commit_index: 0,
-            last_applied: 0,
-            next_index: vec![],
-            match_index: vec![],
-
-            default_election_timeout: cfg.election_tick_timeout,
-            election_tick_rand: cfg
-                .election_tick_rand
-                .unwrap_or((0, cfg.election_tick_timeout - 1)),
-            heartbeat_timeout: cfg.heartbeat_tick_timeout,
-
-            election_ticks_elapsed: 0,
-            heartbeat_ticks_elapsed: 0,
-        };
-
-        Node { raft }
+        Node {
+            raft: Raft::new(cfg),
+        }
     }
 
     pub fn id(&self) -> NodeId {
@@ -230,6 +228,10 @@ impl Node {
     }
 
     pub fn step(&mut self, m: &Message) -> Option<Ready> {
+        if m.from() == self.id() {
+            panic!("Node cannot process message to itself: {:?}", m);
+        }
+
         match self.raft.state {
             NodeState::FOLLOWER => self.raft.step_follower(m),
             NodeState::CANDIDATE => self.raft.step_candidate(m),
@@ -246,10 +248,12 @@ impl Node {
     }
 }
 
+#[derive(Debug)]
 struct Raft {
     id: NodeId,
     state: NodeState,
     peers: Vec<NodeId>,
+    msg_store: MsgStore,
 
     // Persistent state on all servers (updated on stable storage before responding to RPCs).
     current_term: u32,
@@ -269,14 +273,44 @@ struct Raft {
 
     // Cluster behavior determined from Config.
     default_election_timeout: u32,
-    election_tick_rand: (u32, u32),
+    election_tick_rand: u32,
     heartbeat_timeout: u32,
 
+    actual_election_timeout: u32,
     election_ticks_elapsed: u32,
     heartbeat_ticks_elapsed: u32,
 }
 
 impl Raft {
+    fn new(cfg: Config) -> Self {
+        Self {
+            id: cfg.id,
+            state: NodeState::FOLLOWER,
+            peers: cfg.peers,
+            storage: cfg.storage,
+            msg_store: MsgStore::new(),
+
+            current_term: 0,
+            voted_for: None,
+            election: None,
+            commit_index: 0,
+            last_applied: 0,
+            next_index: vec![],
+            match_index: vec![],
+
+            default_election_timeout: cfg.election_tick_timeout,
+            election_tick_rand: cfg.election_tick_rand,
+            heartbeat_timeout: cfg.heartbeat_tick_timeout,
+
+            // Want the first election timeout cycle to have the same behavior as future cycles.
+            // TODO: Clean up the instantiation of Raft
+            actual_election_timeout: cfg.election_tick_timeout
+                + Raft::rand_nonnegative(cfg.election_tick_rand),
+            election_ticks_elapsed: 0,
+            heartbeat_ticks_elapsed: 0,
+        }
+    }
+
     fn tick_follower(&mut self) -> Option<Ready> {
         self.election_ticks_elapsed += 1;
         if self.election_timed_out() {
@@ -305,14 +339,27 @@ impl Raft {
     }
 
     fn election_timed_out(&self) -> bool {
-        self.election_ticks_elapsed >= self.default_election_timeout
+        self.election_ticks_elapsed >= self.actual_election_timeout
     }
 
     fn heartbeat_timed_out(&self) -> bool {
         self.heartbeat_ticks_elapsed >= self.heartbeat_timeout
     }
 
+    /// Utility function for generating a random number in the range [0, max]
+    ///
+    /// Should this be in Raft, or separate utility module?
+    fn rand_nonnegative(max: u32) -> u32 {
+        if max == 0 {
+            0
+        } else {
+            rand::random::<u32>() % (max - 1)
+        }
+    }
+
     fn reset_election_timer(&mut self) {
+        let range = Raft::rand_nonnegative(self.election_tick_rand);
+        self.actual_election_timeout = self.default_election_timeout + range;
         self.election_ticks_elapsed = 0;
     }
 
@@ -348,11 +395,11 @@ impl Raft {
         }
     }
 
-    fn broadcast(&self, variant: MessageRPC) -> Vec<Message> {
+    fn broadcast(&mut self, variant: MessageRPC) -> Vec<Message> {
         self.peers
             .iter()
             .map(|to| {
-                Message::new(
+                let mut msg = Message::new(
                     MessageBody {
                         term: self.current_term,
                         variant: variant.clone(),
@@ -362,7 +409,9 @@ impl Raft {
                         from: self.id,
                         to: *to,
                     },
-                )
+                );
+                self.msg_store.insert(self.current_term, &mut msg);
+                msg
             })
             .collect::<Vec<_>>()
     }
@@ -509,9 +558,9 @@ impl Raft {
 
             MessageRPC::RequestVoteResp(vote_granted) => {
                 // If response is not for a RequestVote RPC sent in this current election, then ignore.
-                // if !self.msg_store.matches(self.current_term, &m) {
-                //     return None;
-                // }
+                if !self.msg_store.matches(&m) {
+                    return None;
+                }
 
                 // Otherwise, handle.
                 let election = self.election.get_or_insert(Election::new(&self));
@@ -534,7 +583,7 @@ impl Raft {
         self.send_heartbeat()
     }
 
-    fn send_heartbeat(&self) -> Ready {
+    fn send_heartbeat(&mut self) -> Ready {
         Ready::builder()
             .with_messages(self.broadcast(MessageRPC::AppendEntries(AppendEntriesArgs {
                 leader_id: self.id,

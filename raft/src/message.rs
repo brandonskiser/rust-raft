@@ -19,6 +19,10 @@ impl Message {
         &self.metadata
     }
 
+    pub fn set_rpc_id(&mut self, rpc_id: u32) {
+        self.metadata.rpc_id = rpc_id;
+    }
+
     pub fn from(&self) -> NodeId {
         self.metadata.from
     }
