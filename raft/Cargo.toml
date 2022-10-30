@@ -7,3 +7,6 @@ edition = "2021"
 
 [dependencies]
 log = "0.4.17"
+
+[dev-dependencies]
+assert_matches = "1.5"

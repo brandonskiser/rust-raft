@@ -1,3 +1,4 @@
+use raft::message::*;
 use raft::*;
 
 const CLUSTER_SIZE: u32 = 3;
@@ -26,10 +27,10 @@ fn make_initial_node() -> Node {
     Node::new(test_cfg())
 }
 
-fn make_candidate_node() -> Node {
+fn make_candidate_node() -> (Node, Ready) {
     let mut n = make_initial_node();
-    tick_for(&mut n, ELECTION_TIMEOUT);
-    n
+    let rdy = tick_for(&mut n, ELECTION_TIMEOUT);
+    (n, rdy[0].clone())
 }
 
 fn assert_election_started(node: &Node, rdy: &Ready, term: u32) {
@@ -37,10 +38,8 @@ fn assert_election_started(node: &Node, rdy: &Ready, term: u32) {
     assert_eq!(rdy.messages.len(), 2);
     for (i, m) in rdy.messages.iter().enumerate() {
         assert_eq!(
-            m,
-            &Message {
-                from: 0,
-                to: i as u32 + 1,
+            m.body(),
+            &MessageBody {
                 term,
                 variant: MessageRPC::RequestVote(RequestVoteArgs {
                     candidate_id: 0,
@@ -57,10 +56,8 @@ fn assert_became_leader(node: &Node, rdy: &Ready, term: u32) {
     assert_eq!(rdy.messages.len(), 2);
     for (i, m) in rdy.messages.iter().enumerate() {
         assert_eq!(
-            m,
-            &Message {
-                from: 0,
-                to: i as u32 + 1,
+            m.body(),
+            &MessageBody {
                 term,
                 variant: MessageRPC::AppendEntries(AppendEntriesArgs {
                     leader_id: 0,
@@ -94,7 +91,7 @@ fn new_follower_starts_election_after_timeout() {
 
 #[test]
 fn new_candidate_starts_election_after_timeout() {
-    let mut node = make_candidate_node();
+    let (mut node, _) = make_candidate_node();
 
     assert_eq!(tick_for(&mut node, ELECTION_TIMEOUT - 1).len(), 0);
     let rdy = node.tick().expect("Should have Ready after timeout");
@@ -103,21 +100,60 @@ fn new_candidate_starts_election_after_timeout() {
 }
 
 #[test]
+fn candidate_ignores_vote_from_previous_election() {
+    let (mut node, rdy) = make_candidate_node();
+
+    // Timeout, and start new election.
+    tick_for(&mut node, ELECTION_TIMEOUT);
+
+    let resps = rdy
+        .messages
+        .iter()
+        .map(|m| {
+            Message::new(
+                MessageBody {
+                    term: 1,
+                    variant: MessageRPC::RequestVoteResp(true),
+                },
+                MessageMetadata {
+                    rpc_id: m.metadata().rpc_id,
+                    from: m.from(),
+                    to: 0,
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+
+    for (i, resp) in resps.iter().enumerate() {
+        assert!(
+            node.step(resp).is_none(),
+            "Received unexpected Ready in iteration {}",
+            i
+        );
+    }
+}
+
+#[test]
 fn follower_with_no_logs_responds_to_heartbeat() {
     let mut node = make_initial_node();
 
-    let heartbeat = Message {
-        from: 1,
-        to: 0,
-        term: 0,
-        variant: MessageRPC::AppendEntries(AppendEntriesArgs {
-            leader_id: 1,
-            prev_log_index: 0,
-            prev_log_term: 0,
-            entries: vec![],
-            leader_commit: 0,
-        }),
-    };
+    let heartbeat = Message::new(
+        MessageBody {
+            term: 0,
+            variant: MessageRPC::AppendEntries(AppendEntriesArgs {
+                leader_id: 1,
+                prev_log_index: 0,
+                prev_log_term: 0,
+                entries: vec![],
+                leader_commit: 0,
+            }),
+        },
+        MessageMetadata {
+            rpc_id: 0,
+            from: 1,
+            to: 0,
+        },
+    );
 
     let rdy = node
         .step(&heartbeat)
@@ -125,10 +161,8 @@ fn follower_with_no_logs_responds_to_heartbeat() {
 
     assert_eq!(rdy.messages.len(), 1);
     assert_eq!(
-        rdy.messages[0],
-        Message {
-            from: 0,
-            to: 1,
+        rdy.messages[0].body(),
+        &MessageBody {
             term: 0,
             variant: MessageRPC::AppendEntriesResp(true)
         }
@@ -139,26 +173,29 @@ fn follower_with_no_logs_responds_to_heartbeat() {
 fn follower_with_no_logs_votes_for_candidate() {
     let mut node = make_initial_node();
 
-    let reqvote = Message {
-        from: 1,
-        to: 0,
-        term: 1,
-        variant: MessageRPC::RequestVote(RequestVoteArgs {
-            candidate_id: 1,
-            last_log_index: 0,
-            last_log_term: 0,
-        }),
-    };
+    let reqvote = Message::new(
+        MessageBody {
+            term: 1,
+            variant: MessageRPC::RequestVote(RequestVoteArgs {
+                candidate_id: 1,
+                last_log_index: 0,
+                last_log_term: 0,
+            }),
+        },
+        MessageMetadata {
+            rpc_id: 0,
+            from: 1,
+            to: 0,
+        },
+    );
     let rdy = node
         .step(&reqvote)
         .expect("Should have Ready with RequestVoteResp");
 
     assert_eq!(rdy.messages.len(), 1);
     assert_eq!(
-        rdy.messages[0],
-        Message {
-            from: 0,
-            to: 1,
+        rdy.messages[0].body(),
+        &MessageBody {
             term: 0,
             variant: MessageRPC::RequestVoteResp(true)
         }
@@ -167,17 +204,27 @@ fn follower_with_no_logs_votes_for_candidate() {
 
 #[test]
 fn candidate_with_quorum_becomes_leader() {
-    let mut node = make_candidate_node();
+    let (mut node, rdy) = make_candidate_node();
 
     // Send enough RequestVoteResp(true) to trigger the quorum condition.
     // Note that the node already votes for itself.
     let quorum = CLUSTER_SIZE / 2 + 1;
-    let msgs = (1..quorum)
-        .map(|peer| Message {
-            from: peer,
-            to: 0,
-            term: 0,
-            variant: MessageRPC::RequestVoteResp(true),
+    let msgs = rdy
+        .messages
+        .iter()
+        .take(quorum as usize - 1) // Candidate should vote for itself, so subtract 1.
+        .map(|m| {
+            Message::new(
+                MessageBody {
+                    term: 0,
+                    variant: MessageRPC::RequestVoteResp(true),
+                },
+                MessageMetadata {
+                    rpc_id: m.metadata().rpc_id,
+                    from: m.from(),
+                    to: 0,
+                },
+            )
         })
         .collect::<Vec<_>>();
     for m in msgs[0..msgs.len() - 1].iter() {

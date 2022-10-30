@@ -1,5 +1,6 @@
 use std::collections::VecDeque;
 
+use raft::message::*;
 use raft::*;
 
 struct Cluster {
@@ -47,9 +48,9 @@ impl Cluster {
         let to = self
             .nodes
             .iter_mut()
-            .find(|n| n.id() == msg.to)
-            .expect(format!("node with id {} doesn't exist", msg.to).as_str());
-        
+            .find(|n| n.id() == msg.to())
+            .expect(format!("node with id {} doesn't exist", msg.to()).as_str());
+
         to.step(&msg)
     }
 
