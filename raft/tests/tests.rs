@@ -73,8 +73,8 @@ fn new_default_cfg(id: NodeId) -> Config {
             .into_iter()
             .filter(|peer_id| id != *peer_id)
             .collect(),
-        // election_tick_timeout: 20,
-        // heartbeat_tick_timeout: 2,
+        election_tick_timeout: 20,
+        heartbeat_tick_timeout: 3,
         ..Default::default()
     }
 }

@@ -1,10 +1,7 @@
 pub mod message;
 pub mod storage;
 
-use std::{
-    collections::{HashMap, HashSet},
-    num::NonZeroU32,
-};
+use std::collections::{HashMap, HashSet};
 
 // use rand;
 
@@ -159,12 +156,14 @@ impl ReadyBuilder {
 }
 
 pub type NodeId = u32;
+pub type Command = Vec<u8>;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Entry {
     pub term: u32,
     pub index: u32,
-    pub data: Vec<u8>,
+    pub noop: bool,
+    pub data: Command,
 }
 
 #[derive(Debug)]
@@ -232,10 +231,24 @@ impl Node {
             panic!("Node cannot process message to itself: {:?}", m);
         }
 
+        if m.term() > self.raft.current_term {
+            self.raft.become_follower(m.term());
+        }
+
         match self.raft.state {
             NodeState::FOLLOWER => self.raft.step_follower(m),
             NodeState::CANDIDATE => self.raft.step_candidate(m),
             NodeState::LEADER => self.raft.step_leader(m),
+        }
+    }
+
+    /// TODO: Add error response. Need to add error responses for generally
+    /// all of Node/Raft.
+    pub fn propose(&mut self, command: Command) -> Option<Ready> {
+        if self.state() != NodeState::LEADER {
+            None
+        } else {
+            Some(self.raft.propose(command))
         }
     }
 
@@ -268,8 +281,8 @@ struct Raft {
     last_applied: u32,
 
     // Volatile state specific to leaders.
-    next_index: Vec<u32>,
-    match_index: Vec<u32>,
+    next_index: HashMap<NodeId, u32>,
+    match_index: HashMap<NodeId, u32>,
 
     // Cluster behavior determined from Config.
     default_election_timeout: u32,
@@ -295,8 +308,8 @@ impl Raft {
             election: None,
             commit_index: 0,
             last_applied: 0,
-            next_index: vec![],
-            match_index: vec![],
+            next_index: HashMap::new(),
+            match_index: HashMap::new(),
 
             default_election_timeout: cfg.election_tick_timeout,
             election_tick_rand: cfg.election_tick_rand,
@@ -330,9 +343,10 @@ impl Raft {
     }
 
     fn tick_leader(&mut self) -> Option<Ready> {
+        self.heartbeat_ticks_elapsed += 1;
         if self.heartbeat_timed_out() {
             self.reset_heartbeat_timer();
-            Some(self.send_heartbeat())
+            Some(self.send_heartbeat(false))
         } else {
             None
         }
@@ -405,9 +419,9 @@ impl Raft {
                         variant: variant.clone(),
                     },
                     MessageMetadata {
-                        rpc_id: 0,
                         from: self.id,
                         to: *to,
+                        ..Default::default()
                     },
                 );
                 self.msg_store.insert(self.current_term, &mut msg);
@@ -580,22 +594,70 @@ impl Raft {
     fn become_leader(&mut self) -> Ready {
         self.state = NodeState::LEADER;
         self.reset_heartbeat_timer();
-        self.send_heartbeat()
+
+        // Need to initialize next_index and match_index.
+        self.next_index.clear();
+        self.match_index.clear();
+        let next_index = self.storage.last_index() + 1;
+        for peer in &self.peers {
+            self.next_index.insert(*peer, next_index);
+            self.match_index.insert(*peer, 0);
+        }
+
+        self.send_heartbeat(true)
     }
 
-    fn send_heartbeat(&mut self) -> Ready {
-        Ready::builder()
-            .with_messages(self.broadcast(MessageRPC::AppendEntries(AppendEntriesArgs {
-                leader_id: self.id,
-                prev_log_index: 0,
-                prev_log_term: 0,
-                entries: vec![],
-                leader_commit: self.commit_index,
-            })))
-            .build()
+    fn send_heartbeat(&mut self, include_noop: bool) -> Ready {
+        let mut messages: Vec<Message> = vec![];
+        for to in &self.peers {
+            let prev_log_index = self.next_index.get(to).expect("Impossible") - 1;
+            let prev_log_term = self.storage.term(prev_log_index).expect("Impossible");
+            let mut msg = Message::new(
+                MessageBody {
+                    term: self.current_term,
+                    variant: MessageRPC::AppendEntries(AppendEntriesArgs {
+                        leader_id: self.id,
+                        prev_log_index,
+                        prev_log_term,
+                        entries: if include_noop {
+                            vec![Entry {
+                                term: self.current_term,
+                                index: 0,
+                                noop: true,
+                                data: vec![],
+                            }]
+                        } else {
+                            vec![]
+                        },
+                        leader_commit: self.commit_index,
+                    }),
+                },
+                MessageMetadata {
+                    from: self.id,
+                    to: *to,
+                    ..Default::default()
+                },
+            );
+            self.msg_store.insert(self.current_term, &mut msg);
+            messages.push(msg);
+        }
+
+        Ready::builder().with_messages(messages).build()
     }
 
     fn step_leader(&mut self, m: &Message) -> Option<Ready> {
+        match m.body().variant {
+            MessageRPC::AppendEntriesResp(success) => {
+                if !success {
+                    // Follower didn't have an entry matching prevLogIndex and prevLogTerm.
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+
+    fn propose(&mut self, command: Command) -> Ready {
         unimplemented!()
     }
 }

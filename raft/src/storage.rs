@@ -12,6 +12,8 @@ pub trait Storage: Debug {
     fn entries(&self, lo: u32, hi: u32) -> Vec<Entry>;
 
     fn last_index(&self) -> u32;
+
+    fn last_term(&self) -> u32;
 }
 
 #[derive(Debug)]
@@ -25,6 +27,7 @@ impl MemoryStorage {
             log: vec![Entry {
                 term: 0,
                 index: 0,
+                noop: true,
                 data: vec![],
             }],
         }
@@ -50,5 +53,9 @@ impl Storage for MemoryStorage {
 
     fn last_index(&self) -> u32 {
         self.log.len() as u32 - 1
+    }
+
+    fn last_term(&self) -> u32 {
+        self.log[self.last_index() as usize].term
     }
 }

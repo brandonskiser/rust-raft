@@ -33,6 +33,39 @@ fn make_candidate_node() -> (Node, Ready) {
     (n, rdy[0].clone())
 }
 
+fn make_leader_node() -> (Node, Ready) {
+    let (mut node, rdy) = make_candidate_node();
+
+    // Send enough RequestVoteResp(true) to trigger the quorum condition.
+    // Note that the node already votes for itself.
+    let quorum = CLUSTER_SIZE / 2 + 1;
+    let msgs = rdy
+        .messages
+        .iter()
+        .take(quorum as usize - 1) // Candidate should vote for itself, so subtract 1.
+        .map(|m| {
+            Message::new(
+                MessageBody {
+                    term: 0,
+                    variant: MessageRPC::RequestVoteResp(true),
+                },
+                MessageMetadata {
+                    rpc_id: m.metadata().rpc_id,
+                    from: m.to(),
+                    to: 0,
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+    for m in msgs[0..msgs.len() - 1].iter() {
+        node.step(m);
+    }
+    let rdy = node
+        .step(&msgs[msgs.len() - 1])
+        .expect("Should have Ready after quorum");
+    (node, rdy)
+}
+
 fn assert_election_started(node: &Node, rdy: &Ready, term: u32) {
     assert_eq!(
         node.state(),
@@ -59,7 +92,7 @@ fn assert_election_started(node: &Node, rdy: &Ready, term: u32) {
 
 fn assert_became_leader(node: &Node, rdy: &Ready, term: u32) {
     assert_eq!(node.state(), NodeState::LEADER);
-    assert_eq!(rdy.messages.len(), 2);
+    assert_eq!(rdy.messages.len() as u32, CLUSTER_SIZE - 1);
     for (i, m) in rdy.messages.iter().enumerate() {
         assert_eq!(
             m.body(),
@@ -70,7 +103,12 @@ fn assert_became_leader(node: &Node, rdy: &Ready, term: u32) {
                     // TODO: Update this config for other test cases.
                     prev_log_index: 0,
                     prev_log_term: 0,
-                    entries: vec![],
+                    entries: vec![Entry {
+                        term,
+                        index: 0,
+                        noop: true,
+                        data: vec![],
+                    }],
                     leader_commit: 0
                 })
             }
@@ -203,7 +241,7 @@ fn follower_with_no_logs_votes_for_candidate() {
     assert_eq!(
         rdy.messages[0].body(),
         &MessageBody {
-            term: 0,
+            term: 1,
             variant: MessageRPC::RequestVoteResp(true)
         }
     );
@@ -211,35 +249,115 @@ fn follower_with_no_logs_votes_for_candidate() {
 
 #[test]
 fn candidate_with_quorum_becomes_leader() {
-    let (mut node, rdy) = make_candidate_node();
-
-    // Send enough RequestVoteResp(true) to trigger the quorum condition.
-    // Note that the node already votes for itself.
-    let quorum = CLUSTER_SIZE / 2 + 1;
-    let msgs = rdy
-        .messages
-        .iter()
-        .take(quorum as usize - 1) // Candidate should vote for itself, so subtract 1.
-        .map(|m| {
-            Message::new(
-                MessageBody {
-                    term: 0,
-                    variant: MessageRPC::RequestVoteResp(true),
-                },
-                MessageMetadata {
-                    rpc_id: m.metadata().rpc_id,
-                    from: m.to(),
-                    to: 0,
-                },
-            )
-        })
-        .collect::<Vec<_>>();
-    for m in msgs[0..msgs.len() - 1].iter() {
-        node.step(m);
-    }
-    let rdy = node
-        .step(&msgs[msgs.len() - 1])
-        .expect("Should have Ready after quorum");
-
+    let (node, rdy) = make_leader_node();
     assert_became_leader(&node, &rdy, 1);
+}
+
+#[test]
+fn candidate_becomes_follower_on_msg_from_new_leader() {
+    let (mut node, _) = make_candidate_node();
+    let msg = Message::new(
+        MessageBody {
+            term: 1,
+            variant: MessageRPC::AppendEntries(AppendEntriesArgs {
+                leader_id: 1,
+                prev_log_index: 0,
+                prev_log_term: 0,
+                leader_commit: 0,
+                entries: vec![],
+            }),
+        },
+        MessageMetadata {
+            rpc_id: 0,
+            from: 1,
+            to: 0,
+        },
+    );
+    node.step(&msg);
+    assert_eq!(node.state(), NodeState::FOLLOWER);
+}
+
+#[test]
+fn leader_sends_heartbeats_after_timeout() {
+    let (mut node, _) = make_leader_node();
+
+    assert_eq!(tick_for(&mut node, HEARTBEAT_TIMEOUT - 1).len(), 0);
+    let rdy = node
+        .tick()
+        .expect("Leader should have Ready after heartbeat timeout");
+
+    assert_eq!(rdy.messages.len() as u32, CLUSTER_SIZE - 1);
+    for m in rdy.messages {
+        assert_eq!(
+            m.body(),
+            &MessageBody {
+                term: 1,
+                variant: MessageRPC::AppendEntries(AppendEntriesArgs {
+                    leader_id: 0,
+                    prev_log_index: 0,
+                    prev_log_term: 0,
+                    entries: vec![],
+                    leader_commit: 0
+                })
+            }
+        )
+    }
+}
+
+#[test]
+fn all_servers_become_follower_on_msg_with_higher_term() {
+    let (mut candidate, _) = make_candidate_node();
+    let (mut leader, _) = make_leader_node();
+
+    let msg = Message::new(
+        MessageBody {
+            term: 3,
+            variant: MessageRPC::AppendEntries(AppendEntriesArgs {
+                leader_id: 1,
+                prev_log_index: 0,
+                prev_log_term: 0,
+                entries: vec![],
+                leader_commit: 0,
+            }),
+        },
+        MessageMetadata {
+            rpc_id: 0,
+            from: 1,
+            to: 0,
+        },
+    );
+
+    candidate.step(&msg);
+    leader.step(&msg);
+    assert_eq!(candidate.state(), NodeState::FOLLOWER);
+    assert_eq!(leader.state(), NodeState::FOLLOWER);
+}
+
+#[test]
+fn leader_takes_client_command() {
+    let (mut node, _) = make_leader_node();
+
+    let cmd = "test".as_bytes().to_vec();
+    let rdy = node.propose("test".as_bytes().to_vec().clone()).unwrap();
+    assert_eq!(rdy.messages.len() as u32, CLUSTER_SIZE - 1);
+    for m in rdy.messages {
+        assert_eq!(
+            m.body(),
+            &MessageBody {
+                term: 1,
+                variant: MessageRPC::AppendEntries(AppendEntriesArgs {
+                    leader_id: 0,
+                    prev_log_index: 0,
+                    prev_log_term: 0,
+                    entries: vec![Entry {
+                        term: 1,
+                        index: 2,
+                        noop: false,
+                        data: cmd.clone()
+                    }],
+                    leader_commit: 0
+                })
+            }
+        )
+    }
 }
