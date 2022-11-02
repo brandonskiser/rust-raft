@@ -1,18 +1,23 @@
 pub mod message;
 pub mod storage;
 
-use std::collections::{HashMap, HashSet};
+use std::{
+    cell::RefCell,
+    collections::{HashMap, HashSet},
+    rc::Rc,
+    vec,
+};
 
 // use rand;
 
 use message::*;
 use storage::*;
 
-pub struct Config {
+pub struct Config<S: Storage> {
     pub id: NodeId,
     pub peers: Vec<NodeId>,
 
-    pub storage: Box<dyn Storage>,
+    pub storage: S,
 
     /// The number of ticks that must pass until a node starts an election.
     pub election_tick_timeout: u32,
@@ -22,16 +27,18 @@ pub struct Config {
     /// will be a value in the range [election_tick_timeout, 2 * election_tick_timeout - 1]
     pub election_tick_rand: u32,
 
-    /// The number of ticks that must pass until a leader sends a heartbeat message.
+    /// The number of ticks that must pass until a leader sends a heartbeat message. It is
+    /// suggested to set election_tick_timeout = 10 * heartbeat_tick_timeout to prevent
+    /// unnecessary leader switching.
     pub heartbeat_tick_timeout: u32,
 }
 
-impl Default for Config {
-    fn default() -> Self {
+impl<S: Storage> Config<S> {
+    pub fn new_with_defaults(id: NodeId, peers: Vec<NodeId>, storage: S) -> Self {
         Self {
-            id: 0,
-            peers: vec![],
-            storage: Box::new(MemoryStorage::new()),
+            id,
+            peers,
+            storage,
             election_tick_timeout: 10,
             election_tick_rand: 9,
             heartbeat_tick_timeout: 1,
@@ -92,7 +99,7 @@ pub struct Ready {
     /// Messages to be sent to peers.
     pub messages: Vec<Message>,
 
-    /// Entries to be persisted to stable store.
+    /// Entries to be persisted to stable store before messages are sent.
     pub entries: Vec<Entry>,
 
     /// Entries to be applied to the state machine. Note that these are expected
@@ -126,7 +133,7 @@ impl ReadyBuilder {
         self
     }
 
-    fn with_response(mut self, raft: &Raft, m: &Message, resp: MessageRPC) -> Self {
+    fn with_response<S: Storage>(mut self, raft: &Raft<S>, m: &Message, resp: MessageRPC) -> Self {
         self.messages.push(Message::new(
             MessageBody {
                 term: raft.current_term,
@@ -166,6 +173,17 @@ pub struct Entry {
     pub data: Command,
 }
 
+impl Entry {
+    fn new_noop(term: u32, index: u32) -> Self {
+        Self {
+            term,
+            index,
+            noop: true,
+            data: vec![],
+        }
+    }
+}
+
 #[derive(Debug)]
 struct Election {
     term: u32,
@@ -175,7 +193,7 @@ struct Election {
 }
 
 impl Election {
-    fn new(raft: &Raft) -> Self {
+    fn new<S: Storage>(raft: &Raft<S>) -> Self {
         Self {
             term: raft.current_term,
             // Node always votes for itself.
@@ -198,12 +216,12 @@ impl Election {
 
 /// Represents a single node participating in a Raft cluster.
 #[derive(Debug)]
-pub struct Node {
-    raft: Raft,
+pub struct Node<S: Storage> {
+    raft: Raft<S>,
 }
 
-impl Node {
-    pub fn new(cfg: Config) -> Self {
+impl<S: Storage> Node<S> {
+    pub fn new(cfg: Config<S>) -> Self {
         // TODO: validate cfg
         Node {
             raft: Raft::new(cfg),
@@ -262,16 +280,20 @@ impl Node {
 }
 
 #[derive(Debug)]
-struct Raft {
+struct Raft<S: Storage> {
     id: NodeId,
     state: NodeState,
     peers: Vec<NodeId>,
     msg_store: MsgStore,
 
+    // State to be included in the next Ready.
+    entries: Vec<Entry>,
+    committed_entries: Vec<Entry>,
+
     // Persistent state on all servers (updated on stable storage before responding to RPCs).
     current_term: u32,
     voted_for: Option<NodeId>,
-    storage: Box<dyn Storage>,
+    storage: S,
 
     // Persistent state for candidates.
     election: Option<Election>,
@@ -294,14 +316,17 @@ struct Raft {
     heartbeat_ticks_elapsed: u32,
 }
 
-impl Raft {
-    fn new(cfg: Config) -> Self {
+impl<S: Storage> Raft<S> {
+    fn new(cfg: Config<S>) -> Self {
         Self {
             id: cfg.id,
             state: NodeState::FOLLOWER,
             peers: cfg.peers,
             storage: cfg.storage,
             msg_store: MsgStore::new(),
+
+            entries: vec![],
+            committed_entries: vec![],
 
             current_term: 0,
             voted_for: None,
@@ -318,7 +343,7 @@ impl Raft {
             // Want the first election timeout cycle to have the same behavior as future cycles.
             // TODO: Clean up the instantiation of Raft
             actual_election_timeout: cfg.election_tick_timeout
-                + Raft::rand_nonnegative(cfg.election_tick_rand),
+                + Raft::<S>::rand_nonnegative(cfg.election_tick_rand),
             election_ticks_elapsed: 0,
             heartbeat_ticks_elapsed: 0,
         }
@@ -372,7 +397,7 @@ impl Raft {
     }
 
     fn reset_election_timer(&mut self) {
-        let range = Raft::rand_nonnegative(self.election_tick_rand);
+        let range = Raft::<S>::rand_nonnegative(self.election_tick_rand);
         self.actual_election_timeout = self.default_election_timeout + range;
         self.election_ticks_elapsed = 0;
     }
@@ -467,13 +492,9 @@ impl Raft {
             // Check if the log is at least up-to-date as this node's log.
             // Specifically, check if candidate's lastLogTerm is >, or if
             // equal, lastLogIndex is >=
-            let last_term = self
-                .storage
-                .term(self.storage.last_index())
-                .expect("Always have a log entry");
+            let last_term = self.storage.last_term();
             if args.last_log_term > last_term
-                || args.last_log_term == last_term
-                    && args.last_log_index >= self.storage.last_index()
+                || args.last_log_term == last_term && args.last_log_index >= self.storage.last_index()
             {
                 true
             } else {
@@ -620,12 +641,7 @@ impl Raft {
                         prev_log_index,
                         prev_log_term,
                         entries: if include_noop {
-                            vec![Entry {
-                                term: self.current_term,
-                                index: 0,
-                                noop: true,
-                                data: vec![],
-                            }]
+                            vec![Entry::new_noop(self.current_term, self.storage.last_index() + 1)]
                         } else {
                             vec![]
                         },
@@ -642,7 +658,17 @@ impl Raft {
             messages.push(msg);
         }
 
-        Ready::builder().with_messages(messages).build()
+        if include_noop {
+            self.entries = vec![Entry::new_noop(
+                self.current_term,
+                self.storage.last_index() + 1,
+            )];
+        }
+
+        Ready::builder()
+            .with_messages(messages)
+            .with_entries(self.entries.clone())
+            .build()
     }
 
     fn step_leader(&mut self, m: &Message) -> Option<Ready> {
@@ -658,6 +684,41 @@ impl Raft {
     }
 
     fn propose(&mut self, command: Command) -> Ready {
-        unimplemented!()
+        // 1. Append command to the log
+        let entries = vec![Entry {
+            term: self.current_term,
+            index: self.storage.last_index() + 1,
+            noop: false,
+            data: command,
+        }];
+        // 2. Broadcast to peers.
+        let mut messages: Vec<Message> = vec![];
+        for to in &self.peers {
+            let prev_log_index = self.next_index.get(to).expect("Impossible") - 1;
+            let prev_log_term = self.storage.term(prev_log_index).expect("Impossible");
+            let mut msg = Message::new(
+                MessageBody {
+                    term: self.current_term,
+                    variant: MessageRPC::AppendEntries(AppendEntriesArgs {
+                        leader_id: self.id,
+                        prev_log_index,
+                        prev_log_term,
+                        entries: entries.clone(),
+                        leader_commit: self.commit_index,
+                    }),
+                },
+                MessageMetadata {
+                    rpc_id: 0,
+                    from: self.id,
+                    to: *to,
+                },
+            );
+            self.msg_store.insert(self.current_term, &mut msg);
+            messages.push(msg);
+        }
+        Ready::builder()
+            .with_entries(entries)
+            .with_messages(messages)
+            .build()
     }
 }

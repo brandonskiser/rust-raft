@@ -1,35 +1,78 @@
 use std::collections::VecDeque;
 use std::fmt::Debug;
+use std::rc::Rc;
 
 use raft::message::*;
+use raft::storage::*;
 use raft::*;
 
+const NODE_IDS: [NodeId; 3] = [1, 2, 3];
+const ELECTION_TIMEOUT: u32 = 20;
+const HEARTBEAT_TIMEOUT: u32 = 3;
+
+#[derive(Debug)]
+struct Server {
+    node: Node<Rc<MemoryStorage>>,
+    storage: Rc<MemoryStorage>,
+}
+
+impl Server {
+    fn new(id: NodeId) -> Self {
+        let storage = Rc::new(MemoryStorage::new());
+        let cfg = Config {
+            id,
+            peers: NODE_IDS
+                .into_iter()
+                .filter(|peer_id| id != *peer_id)
+                .collect(),
+            storage: Rc::clone(&storage),
+            election_tick_timeout: ELECTION_TIMEOUT,
+            election_tick_rand: 9,
+            heartbeat_tick_timeout: HEARTBEAT_TIMEOUT,
+        };
+        Server {
+            node: Node::new(cfg),
+            storage,
+        }
+    }
+}
+
 struct Cluster {
-    nodes: Vec<Node>,
+    servers: Vec<Server>,
 }
 
 impl Cluster {
-    fn new(nodes: Vec<Node>) -> Cluster {
-        Cluster { nodes }
+    fn new() -> Cluster {
+        let servers = NODE_IDS
+            .into_iter()
+            .map(|id| Server::new(id))
+            .collect::<Vec<Server>>();
+
+        println!("Created test cluster: {:?}", servers);
+
+        Cluster { servers }
     }
 
     /// Return true if cluster has a leader, false if timed out.
-    fn tick_while_no_leader(&mut self, tick_timeout: u32) -> (bool, Vec<impl IntoIterator + Debug>) {
+    fn tick_while_no_leader(
+        &mut self,
+        tick_timeout: u32,
+    ) -> (bool, Vec<impl IntoIterator + Debug>) {
         let mut ticks = 0;
         let mut state_history: Vec<Vec<NodeState>> = vec![];
         while ticks < tick_timeout && !self.has_leader() {
             self.tick_all();
             ticks += 1;
-            state_history.push(self.nodes.iter().map(|n| n.state()).collect());
+            state_history.push(self.servers.iter().map(|s| s.node.state()).collect());
         }
         (self.has_leader(), state_history)
     }
 
     fn tick_all(&mut self) {
         let rdys = self
-            .nodes
+            .servers
             .iter_mut()
-            .filter_map(|n| n.tick())
+            .filter_map(|s| s.node.tick())
             .collect::<Vec<_>>();
         println!("tick_all got rdys: {:?}", rdys);
         self.handle_readys(rdys.into_iter());
@@ -52,46 +95,24 @@ impl Cluster {
 
     fn send_msg(&mut self, msg: Message) -> Option<Ready> {
         let to = self
-            .nodes
+            .servers
             .iter_mut()
-            .find(|n| n.id() == msg.to())
+            .find(|s| s.node.id() == msg.to())
             .expect(format!("node with id {} doesn't exist", msg.to()).as_str());
 
-        to.step(&msg)
+        to.node.step(&msg)
     }
 
     fn has_leader(&self) -> bool {
-        self.nodes.iter().any(|n| n.state() == NodeState::LEADER)
+        self.servers
+            .iter()
+            .any(|s| s.node.state() == NodeState::LEADER)
     }
-}
-
-fn new_default_cfg(id: NodeId) -> Config {
-    assert!(id >= 1 && id <= 3, "id should be between 1 and 3");
-    Config {
-        id,
-        peers: vec![1, 2, 3]
-            .into_iter()
-            .filter(|peer_id| id != *peer_id)
-            .collect(),
-        election_tick_timeout: 20,
-        heartbeat_tick_timeout: 3,
-        ..Default::default()
-    }
-}
-
-fn new_test_cluster() -> Cluster {
-    let nodes = (1..4)
-        .into_iter()
-        .map(|id| Node::new(new_default_cfg(id)))
-        .collect::<Vec<Node>>();
-
-    println!("Created test cluster: {:?}", nodes);
-    Cluster::new(nodes)
 }
 
 #[test]
 fn new_cluster_will_select_leader() {
-    let mut cluster = new_test_cluster();
+    let mut cluster = Cluster::new();
     let (has_leader, history) = cluster.tick_while_no_leader(100);
     assert!(
         has_leader,
