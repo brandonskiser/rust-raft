@@ -2,11 +2,12 @@ use std::rc::Rc;
 
 use raft::message::*;
 use raft::storage::*;
-use raft::*;
+use raft::node::*;
 
 const CLUSTER_SIZE: u32 = 3;
 const ELECTION_TIMEOUT: u32 = 10;
 const HEARTBEAT_TIMEOUT: u32 = 1;
+const QUORUM: u32 = CLUSTER_SIZE / 2 + 1;
 
 struct NodeTester {
     node: Node<Rc<MemoryStorage>>,
@@ -35,6 +36,9 @@ impl NodeTester {
         (nt, rdy[0].clone())
     }
 
+    /// Creates a new leader node for term 1 with no received client commands.
+    /// The returned `Ready` will include the noop entry to be persisted along
+    /// with the initial AppendEntries RPC to its peers.
     fn new_leader_node() -> (Self, Ready) {
         let (mut nt, rdy) = NodeTester::new_candidate_node();
 
@@ -103,7 +107,7 @@ impl NodeTester {
             noop: true,
             data: vec![],
         };
-        for (i, m) in rdy.messages.iter().enumerate() {
+        for m in &rdy.messages {
             assert_eq!(
                 m.body(),
                 &MessageBody {
@@ -122,6 +126,36 @@ impl NodeTester {
         // Leader makes no-op entry.
         assert_eq!(rdy.entries.len(), 1);
         assert_eq!(rdy.entries[0], noop);
+    }
+
+    fn persist_entries(&mut self, rdy: &mut Ready) {
+        self.storage.append_entries(&mut rdy.entries);
+    }
+
+    fn respond_success(&mut self, messages: &[Message]) -> Vec<Ready> {
+        assert!(self.node.state() != NodeState::FOLLOWER);
+        let mut rdys: Vec<Ready> = vec![];
+        for m in messages {
+            let rdy = self.node.step(&Message::new(
+                MessageBody {
+                    term: m.term(),
+                    variant: if self.node.state() == NodeState::CANDIDATE {
+                        MessageRPC::RequestVoteResp(true)
+                    } else {
+                        MessageRPC::AppendEntriesResp(true)
+                    },
+                },
+                MessageMetadata {
+                    rpc_id: m.metadata().rpc_id,
+                    from: m.to(),
+                    to: m.from(),
+                },
+            ));
+            if let Some(rdy) = rdy {
+                rdys.push(rdy);
+            }
+        }
+        rdys
     }
 
     fn tick_for(&mut self, times: u32) -> Vec<Ready> {
@@ -166,33 +200,10 @@ fn candidate_ignores_vote_from_previous_election() {
 
     // Timeout, and start a second election.
     nt.tick_for(ELECTION_TIMEOUT);
+    // Receive responses from first election.
+    let rdy = nt.respond_success(&rdy.messages[0..rdy.messages.len()]);
 
-    // Create peer responses from the first election.
-    let resps = rdy
-        .messages
-        .iter()
-        .map(|m| {
-            Message::new(
-                MessageBody {
-                    term: 1,
-                    variant: MessageRPC::RequestVoteResp(true),
-                },
-                MessageMetadata {
-                    rpc_id: m.metadata().rpc_id,
-                    from: m.to(),
-                    to: 0,
-                },
-            )
-        })
-        .collect::<Vec<_>>();
-
-    for (i, resp) in resps.iter().enumerate() {
-        assert!(
-            nt.node.step(resp).is_none(),
-            "Received unexpected Ready in iteration {}",
-            i
-        );
-    }
+    assert_eq!(rdy.len(), 0);
 }
 
 #[test]
@@ -356,12 +367,12 @@ fn all_servers_become_follower_on_msg_with_higher_term() {
 #[test]
 fn leader_takes_client_command() {
     let (mut nt, mut rdy) = NodeTester::new_leader_node();
-    nt.storage.append_entries(&mut rdy.entries);
+    nt.persist_entries(&mut rdy);
 
-    let cmd = "test".as_bytes().to_vec();
-    let rdy = nt.node.propose("test".as_bytes().to_vec().clone()).unwrap();
+    let test_cmd = "test".as_bytes().to_vec();
+    let rdy = nt.node.propose(test_cmd.clone()).unwrap();
 
-    // Assert messages.
+    // Assert messages sent to peers. Send the noop and newly proposed command.
     assert_eq!(rdy.messages.len() as u32, CLUSTER_SIZE - 1);
     for m in rdy.messages {
         assert_eq!(
@@ -372,12 +383,20 @@ fn leader_takes_client_command() {
                     leader_id: 0,
                     prev_log_index: 0,
                     prev_log_term: 0,
-                    entries: vec![Entry {
-                        term: 1,
-                        index: 2,
-                        noop: false,
-                        data: cmd.clone()
-                    }],
+                    entries: vec![
+                        Entry {
+                            term: 1,
+                            index: 1,
+                            noop: true,
+                            data: vec![],
+                        },
+                        Entry {
+                            term: 1,
+                            index: 2,
+                            noop: false,
+                            data: test_cmd.clone()
+                        }
+                    ],
                     leader_commit: 0
                 })
             }
@@ -392,7 +411,56 @@ fn leader_takes_client_command() {
             term: 1,
             index: 2,
             noop: false,
-            data: cmd.clone()
+            data: test_cmd.clone()
         }
     );
+}
+
+#[test]
+fn leader_commits_command_on_quorum() {
+    let (mut nt, mut rdy) = NodeTester::new_leader_node();
+    nt.persist_entries(&mut rdy);
+
+    let test_cmd = "test".as_bytes().to_vec();
+    let mut rdy = nt.node.propose(test_cmd.clone()).unwrap();
+    nt.persist_entries(&mut rdy);
+
+    // Respond with AppendEntriesResp(true) just before quorum is reached.
+    assert_eq!(
+        nt.respond_success(&rdy.messages[0..(QUORUM as usize - 2)])
+            .len(),
+        0
+    );
+    // Expect a Ready when quorum is reached.
+    let rdy = nt.respond_success(&rdy.messages[(QUORUM as usize - 2)..(QUORUM as usize - 1)]);
+    assert_eq!(rdy.len(), 1, "Should have Ready on quorum");
+    assert_eq!(
+        rdy[0].committed_entries[0],
+        Entry {
+            term: 1,
+            index: 2,
+            noop: false,
+            data: test_cmd.clone()
+        }
+    );
+    for m in &rdy[0].messages {
+        assert_eq!(
+            m.body(),
+            &MessageBody {
+                term: 1,
+                variant: MessageRPC::AppendEntries(AppendEntriesArgs {
+                    leader_id: 0,
+                    prev_log_index: 1,
+                    prev_log_term: 1,
+                    entries: vec![],
+                    leader_commit: 2
+                })
+            }
+        );
+    }
+}
+
+#[test]
+fn follower_updates_commit_index() {
+    let (mut nt) = NodeTester::new_initial_node();
 }

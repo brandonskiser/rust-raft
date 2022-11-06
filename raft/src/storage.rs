@@ -2,7 +2,7 @@ use std::cell::RefCell;
 use std::fmt::Debug;
 use std::rc::Rc;
 
-use crate::Entry;
+use crate::node::Entry;
 
 pub trait Storage: Debug {
     /// Returns the term of the entry at the given index, returning `None` if no
@@ -26,6 +26,8 @@ pub struct MemoryStorage {
 impl MemoryStorage {
     pub fn new() -> Self {
         Self {
+            // First index in the Raft log is 1, so this is just a dummy
+            // value to map to normal 0-indexed arrays.
             log: RefCell::new(vec![Entry {
                 term: 0,
                 index: 0,
@@ -60,7 +62,7 @@ impl Storage for MemoryStorage {
     }
 
     fn entries(&self, lo: u32, hi: u32) -> Vec<Entry> {
-        unimplemented!()
+        self.log.borrow()[lo as usize..=hi as usize].to_vec()
     }
 
     fn last_index(&self) -> u32 {
@@ -82,7 +84,7 @@ impl<T: Storage> Storage for Rc<T> {
     }
 
     fn entries(&self, lo: u32, hi: u32) -> Vec<Entry> {
-        unimplemented!()
+        (**self).entries(lo, hi)
     }
 
     fn last_index(&self) -> u32 {

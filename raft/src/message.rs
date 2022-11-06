@@ -1,4 +1,4 @@
-use crate::{Entry, NodeId};
+use crate::node::{Entry, NodeId};
 
 #[derive(Clone, Debug)]
 pub struct Message {
@@ -33,6 +33,13 @@ impl Message {
 
     pub fn term(&self) -> u32 {
         self.body.term
+    }
+
+    pub fn is_append_entries(&self) -> bool {
+        match self.body.variant {
+           MessageRPC::AppendEntries(_) => true,
+           _ => false
+        }
     }
 }
 

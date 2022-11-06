@@ -4,7 +4,7 @@ use std::rc::Rc;
 
 use raft::message::*;
 use raft::storage::*;
-use raft::*;
+use raft::node::*;
 
 const NODE_IDS: [NodeId; 3] = [1, 2, 3];
 const ELECTION_TIMEOUT: u32 = 20;
@@ -34,6 +34,10 @@ impl Server {
             node: Node::new(cfg),
             storage,
         }
+    }
+
+    fn persist_entries(&mut self, rdy: &mut Ready) {
+        self.storage.append_entries(&mut rdy.entries);
     }
 }
 
@@ -72,7 +76,14 @@ impl Cluster {
         let rdys = self
             .servers
             .iter_mut()
-            .filter_map(|s| s.node.tick())
+            .filter_map(|s| {
+                if let Some(mut rdy) = s.node.tick() {
+                    s.persist_entries(&mut rdy);
+                    Some(rdy)
+                } else {
+                    None
+                }
+            })
             .collect::<Vec<_>>();
         println!("tick_all got rdys: {:?}", rdys);
         self.handle_readys(rdys.into_iter());
@@ -83,9 +94,11 @@ impl Cluster {
         let mut queue = rdys.flat_map(|r| r.messages).collect::<VecDeque<_>>();
 
         while let Some(msg) = queue.pop_front() {
+            let to = msg.to();
             println!("Sending message: {:?}", msg);
-            if let Some(rdy) = self.send_msg(msg) {
+            if let Some(mut rdy) = self.send_msg(msg) {
                 println!("Post message rdy: {:?}", rdy);
+                self.get_server_mut(to).persist_entries(&mut rdy);
                 for m in rdy.messages {
                     queue.push_back(m);
                 }
@@ -93,13 +106,10 @@ impl Cluster {
         }
     }
 
+    /// Calls `step(msg)` on the message's `to()` node. This method does NOT
+    /// persist the log entries returned by the Ready `entries` vector.
     fn send_msg(&mut self, msg: Message) -> Option<Ready> {
-        let to = self
-            .servers
-            .iter_mut()
-            .find(|s| s.node.id() == msg.to())
-            .expect(format!("node with id {} doesn't exist", msg.to()).as_str());
-
+        let to = self.get_server_mut(msg.to());
         to.node.step(&msg)
     }
 
@@ -107,6 +117,13 @@ impl Cluster {
         self.servers
             .iter()
             .any(|s| s.node.state() == NodeState::LEADER)
+    }
+
+    fn get_server_mut(&mut self, node_id: NodeId) -> &mut Server {
+        self.servers
+            .iter_mut()
+            .find(|s| s.node.id() == node_id)
+            .unwrap()
     }
 }
 
