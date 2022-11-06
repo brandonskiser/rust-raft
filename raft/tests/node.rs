@@ -1,8 +1,9 @@
 use std::rc::Rc;
 
+use raft::Config;
+use raft::node::*;
 use raft::message::*;
 use raft::storage::*;
-use raft::node::*;
 
 const CLUSTER_SIZE: u32 = 3;
 const ELECTION_TIMEOUT: u32 = 10;
@@ -175,7 +176,7 @@ fn node_init_state() {
 }
 
 #[test]
-fn new_follower_starts_election_after_timeout() {
+fn follower_starts_election_after_timeout() {
     let mut nt = NodeTester::new_initial_node();
 
     assert_eq!(nt.tick_for(ELECTION_TIMEOUT - 1).len(), 0);
@@ -185,7 +186,7 @@ fn new_follower_starts_election_after_timeout() {
 }
 
 #[test]
-fn new_candidate_starts_election_after_timeout() {
+fn candidate_starts_election_after_timeout() {
     let (mut nt, _) = NodeTester::new_candidate_node();
 
     assert_eq!(nt.tick_for(ELECTION_TIMEOUT - 1).len(), 0);

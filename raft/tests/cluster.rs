@@ -2,9 +2,10 @@ use std::collections::VecDeque;
 use std::fmt::Debug;
 use std::rc::Rc;
 
+use raft::Config;
+use raft::node::*;
 use raft::message::*;
 use raft::storage::*;
-use raft::node::*;
 
 const NODE_IDS: [NodeId; 3] = [1, 2, 3];
 const ELECTION_TIMEOUT: u32 = 20;

@@ -3,89 +3,20 @@ use std::{
     vec,
 };
 
+use crate::config::*;
 use crate::message::*;
 use crate::storage::*;
 
-pub struct Config<S: Storage> {
-    pub id: NodeId,
-    pub peers: Vec<NodeId>,
+pub type NodeId = u32;
 
-    pub storage: S,
-
-    /// The number of ticks that must pass until a node starts an election.
-    pub election_tick_timeout: u32,
-
-    /// The highest number that will be randomly added to election_tick_timeout per
-    /// timeout cycle. Defaults to election_tick_timeout - 1, thus the actual election_tick_timeout
-    /// will be a value in the range [election_tick_timeout, 2 * election_tick_timeout - 1]
-    pub election_tick_rand: u32,
-
-    /// The number of ticks that must pass until a leader sends a heartbeat message. It is
-    /// suggested to set election_tick_timeout = 10 * heartbeat_tick_timeout to prevent
-    /// unnecessary leader switching.
-    pub heartbeat_tick_timeout: u32,
-}
-
-impl<S: Storage> Config<S> {
-    pub fn new_with_defaults(id: NodeId, peers: Vec<NodeId>, storage: S) -> Self {
-        Self {
-            id,
-            peers,
-            storage,
-            election_tick_timeout: 10,
-            election_tick_rand: 9,
-            heartbeat_tick_timeout: 1,
-        }
-    }
-}
+/// `Command` represents the input a client applies to the state machine.
+pub type Command = Vec<u8>;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum NodeState {
     FOLLOWER,
     CANDIDATE,
     LEADER,
-}
-
-#[derive(Debug)]
-struct MsgStore {
-    /// Term for which this message store is valid.
-    term: u32,
-
-    /// Map of peer id's to rpc_id's.
-    sent: HashMap<NodeId, Message>,
-}
-
-impl MsgStore {
-    fn new() -> Self {
-        Self {
-            term: 0,
-            sent: HashMap::new(),
-        }
-    }
-
-    fn get(&self, node_id: NodeId, rpc_id: u32) -> Option<&Message> {
-        self.sent.get(&node_id)
-    }
-
-    fn insert(&mut self, term: u32, msg: &mut Message) -> u32 {
-        if term > self.term {
-            self.term = term;
-            self.sent.clear();
-        }
-        // For now, just use a random id.
-        let rpc_id = rand::random();
-        msg.set_rpc_id(rpc_id);
-        self.sent.insert(msg.to(), msg.clone());
-        rpc_id
-    }
-
-    fn matches(&self, msg: &Message) -> bool {
-        if let Some(sent) = self.sent.get(&msg.from()) {
-            sent.metadata().rpc_id == msg.metadata().rpc_id
-        } else {
-            false
-        }
-    }
 }
 
 /// Ready encapsulates the entries that are expected to be saved to stable storage, applied
@@ -104,9 +35,6 @@ pub struct Ready {
     pub committed_entries: Vec<Entry>,
 }
 
-pub type NodeId = u32;
-pub type Command = Vec<u8>;
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Entry {
     pub term: u32,
@@ -122,36 +50,6 @@ impl Entry {
             index,
             noop: true,
             data: vec![],
-        }
-    }
-}
-
-#[derive(Debug)]
-struct Election {
-    term: u32,
-    responded_peers: HashSet<NodeId>,
-    votes_received: u32,
-    quorum: u32,
-}
-
-impl Election {
-    fn new<S: Storage>(raft: &Raft<S>) -> Self {
-        Self {
-            term: raft.current_term,
-            // Node always votes for itself.
-            votes_received: 1,
-            responded_peers: HashSet::<NodeId>::with_capacity(raft.peers.len()),
-            quorum: raft.peers.len() as u32 / 2 + 1,
-        }
-    }
-
-    fn has_quorum(&self) -> bool {
-        self.votes_received >= self.quorum
-    }
-
-    fn apply_response(&mut self, peer: NodeId, vote_granted: bool) {
-        if self.responded_peers.insert(peer) && vote_granted {
-            self.votes_received += 1;
         }
     }
 }
@@ -176,43 +74,6 @@ impl<S: Storage> Node<S> {
 
     pub fn state(&self) -> NodeState {
         self.raft.state
-    }
-
-    fn preprocess(&mut self, msg: Option<&Message>) {
-        if let Some(msg) = msg {
-            if msg.from() == self.id() {
-                panic!("Node cannot process message to itself: {:?}", msg);
-            }
-            if msg.term() > self.raft.current_term {
-                self.raft.become_follower(msg.term());
-            }
-        }
-    }
-
-    fn postprocess(&mut self, rdy: Option<Ready>) -> Option<Ready> {
-        let mut committed_entry: Option<Entry> = None;
-        while self.raft.commit_index > self.raft.last_applied {
-            self.raft.last_applied += 1;
-            let entry = self.raft.storage.get(self.raft.last_applied);
-            if !entry.noop {
-                committed_entry = Some(entry);
-                break;
-            }
-        }
-
-        // If we have a new committed entry, will make a new Ready if the provided
-        // arg is None.
-        if let Some(ce) = committed_entry {
-            if let Some(mut inner_rdy) = rdy {
-                inner_rdy.committed_entries.push(ce);
-                Some(inner_rdy)
-            } else {
-                self.raft.next_committed_entries.push(ce);
-                Some(self.raft.return_ready())
-            }
-        } else {
-            rdy
-        }
     }
 
     pub fn tick(&mut self) -> Option<Ready> {
@@ -257,6 +118,43 @@ impl<S: Storage> Node<S> {
 
     pub fn stop(&self) -> () {
         unimplemented!()
+    }
+
+    fn preprocess(&mut self, msg: Option<&Message>) {
+        if let Some(msg) = msg {
+            if msg.from() == self.id() {
+                panic!("Node cannot process message to itself: {:?}", msg);
+            }
+            if msg.term() > self.raft.current_term {
+                self.raft.become_follower(msg.term());
+            }
+        }
+    }
+
+    fn postprocess(&mut self, rdy: Option<Ready>) -> Option<Ready> {
+        let mut committed_entry: Option<Entry> = None;
+        while self.raft.commit_index > self.raft.last_applied {
+            self.raft.last_applied += 1;
+            let entry = self.raft.storage.get(self.raft.last_applied);
+            if !entry.noop {
+                committed_entry = Some(entry);
+                break;
+            }
+        }
+
+        // If we have a new committed entry, will make a new Ready if the provided
+        // arg is None.
+        if let Some(ce) = committed_entry {
+            if let Some(mut inner_rdy) = rdy {
+                inner_rdy.committed_entries.push(ce);
+                Some(inner_rdy)
+            } else {
+                self.raft.next_committed_entries.push(ce);
+                Some(self.raft.return_ready())
+            }
+        } else {
+            rdy
+        }
     }
 }
 
@@ -360,6 +258,130 @@ impl<S: Storage> Raft<S> {
         }
     }
 
+    fn step_follower(&mut self, m: &Message) -> Option<Ready> {
+        match m.body().variant {
+            MessageRPC::AppendEntries(ref args) => {
+                if m.term() < self.current_term {
+                    self.make_response(m, MessageRPC::AppendEntriesResp(false));
+                    return Some(self.return_ready());
+                }
+
+                // Handle the false check; namely, if the message is from a previous term
+                // or we fail the log consistency check.
+                if m.term() < self.current_term || !self.check_log_consistency(args) {
+                    self.make_response(m, MessageRPC::AppendEntriesResp(false));
+                    return Some(self.return_ready());
+                }
+
+                // Find the first index that conflicts with a new one (same index, different terms),
+                // replacing it and all that follows with the new entries.
+                let mut entries: Vec<Entry> = vec![];
+                if args.entries.len() > 0 {
+                    let mut start_i = args.entries.first().expect("Impossible").index as usize;
+                    for (arg_i, entry) in args.entries.iter().enumerate() {
+                        match self.storage.term(arg_i as u32) {
+                            Some(term) => {
+                                if term != entry.term {
+                                    start_i = arg_i;
+                                    break;
+                                }
+                            }
+                            _ => {
+                                start_i = arg_i;
+                                break;
+                            }
+                        }
+                    }
+                    entries = args.entries[start_i..].to_vec();
+                }
+
+                self.reset_election_timer();
+                self.next_entries = entries;
+                self.make_response(m, MessageRPC::AppendEntriesResp(true));
+                return Some(self.return_ready());
+            }
+
+            MessageRPC::RequestVote(ref args) => return Some(self.handle_request_vote(m, args)),
+
+            // Follower doesn't care about response messages.
+            _ => None,
+        }
+    }
+
+    fn step_candidate(&mut self, m: &Message) -> Option<Ready> {
+        match m.body().variant {
+            MessageRPC::AppendEntries(ref args) => Some(self.handle_append_entries(&m, &args)),
+
+            MessageRPC::RequestVote(ref args) => {
+                // Handle RequestVote same as follower.
+                Some(self.handle_request_vote(&m, args))
+            }
+
+            MessageRPC::RequestVoteResp(vote_granted) => {
+                // If response is not for a RequestVote RPC sent in this current election, then ignore.
+                if !self.msg_store.matches(&m) {
+                    return None;
+                }
+
+                // Otherwise, handle.
+                let election = self.election.get_or_insert(Election::new(&self));
+                election.apply_response(m.from(), vote_granted);
+                if election.has_quorum() {
+                    Some(self.become_leader())
+                } else {
+                    None
+                }
+            }
+
+            // Don't care about AppendEntriesResp
+            _ => None,
+        }
+    }
+
+    fn step_leader(&mut self, m: &Message) -> Option<Ready> {
+        match m.body().variant {
+            MessageRPC::AppendEntriesResp(success) => {
+                let peer_id = m.from();
+                let sent_msg = self.msg_store.get(peer_id, m.metadata().rpc_id)?;
+                if let MessageRPC::AppendEntries(sent_args) = &sent_msg.body().variant {
+                    // If follower didn't have an entry matching prevLogIndex and prevLogTerm, decrement
+                    // its next_index and retry.
+                    if !success {
+                        let curr_next_index = *self
+                            .next_index
+                            .get(&peer_id)
+                            .expect("Should have next_index for all peers");
+                        self.next_index.insert(peer_id, curr_next_index - 1);
+                        self.make_append_entries(&[peer_id], None, false);
+                        Some(self.return_ready())
+                    }
+                    // Otherwise, update next_index and match_index, then check for quorum to
+                    // update commit index.
+                    //
+                    // Taken from the Raft paper: If there exists an N such that N > commitIndex, a
+                    // majority of matchIndex[i] >= N, and log[N].term == currentTerm: set
+                    // commitIndex = N.
+                    else if sent_args.entries.len() > 0 {
+                        let last_index = sent_args.entries.last().unwrap().index;
+                        self.next_index.insert(peer_id, last_index + 1);
+                        self.match_index.insert(peer_id, last_index);
+                        if self.has_quorum(last_index) {
+                            self.commit_index = std::cmp::max(self.commit_index, last_index);
+                        }
+                        None
+                    }
+                    // Do nothing on heartbeat success.
+                    else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
     fn election_timed_out(&self) -> bool {
         self.election_ticks_elapsed >= self.actual_election_timeout
     }
@@ -438,18 +460,6 @@ impl<S: Storage> Raft<S> {
             .collect::<Vec<_>>()
     }
 
-    /// If the message's term is greater than this node's current_term,
-    /// update current_term, convert to follower, and return true.
-    /// Else, return false.
-    fn check_incoming_term(&mut self, m: &Message) -> bool {
-        if m.term() > self.current_term {
-            self.become_follower(m.term());
-            true
-        } else {
-            false
-        }
-    }
-
     fn check_log_consistency(&self, ae: &AppendEntriesArgs) -> bool {
         if ae.prev_log_index == 0 {
             true
@@ -474,10 +484,65 @@ impl<S: Storage> Raft<S> {
         ));
     }
 
-    fn handle_request_vote(&mut self, m: &Message, args: &RequestVoteArgs) -> Option<Ready> {
+    /// AppendEntries RPC receiver behavior is almost entirely equivalent for followers
+    /// and candidates (extra logic for a candidate becoming a follower is added). Thus,
+    /// shared implementation extracted into `handle_append_entries`.
+    fn handle_append_entries(&mut self, m: &Message, args: &AppendEntriesArgs) -> Ready {
+        if m.term() < self.current_term {
+            self.make_response(m, MessageRPC::AppendEntriesResp(false));
+            return self.return_ready();
+        }
+
+        if self.state != NodeState::FOLLOWER {
+            self.become_follower(m.term());
+        }
+
+        // Handle the false check; namely, if the message is from a previous term
+        // or we fail the log consistency check.
+        if m.term() < self.current_term || !self.check_log_consistency(args) {
+            self.make_response(m, MessageRPC::AppendEntriesResp(false));
+            return self.return_ready();
+        }
+
+        // Find the first index that conflicts with a new one (same index, different terms),
+        // replacing it and all that follows with the new entries.
+        let mut entries: Vec<Entry> = vec![];
+        if args.entries.len() > 0 {
+            let mut start_i = args.entries.first().expect("Impossible").index as usize;
+            for (arg_i, entry) in args.entries.iter().enumerate() {
+                match self.storage.term(arg_i as u32) {
+                    Some(term) => {
+                        if term != entry.term {
+                            start_i = arg_i;
+                            break;
+                        }
+                    }
+                    _ => {
+                        start_i = arg_i;
+                        break;
+                    }
+                }
+            }
+            entries = args.entries[start_i..].to_vec();
+        }
+
+        self.reset_election_timer();
+        self.next_entries = entries;
+        self.make_response(m, MessageRPC::AppendEntriesResp(true));
+        return self.return_ready();
+    }
+
+    /// RequestVote RPC behavior is equivalent for both followers and candidates, so shared
+    /// implementation has been extracted into `handle_request_vote`.
+    ///
+    /// Algorithm from the Raft paper:
+    /// 1. Reply false if term < currentTerm
+    /// 2. If votedFor is null or candidateId, and candidate's log is at least up-to-date
+    ///    as receiver's log, grant vote.
+    fn handle_request_vote(&mut self, m: &Message, args: &RequestVoteArgs) -> Ready {
         if m.term() < self.current_term {
             self.make_response(&m, MessageRPC::RequestVoteResp(false));
-            return Some(self.return_ready());
+            return self.return_ready();
         }
 
         let vote_granted = if self.voted_for.is_none() {
@@ -498,98 +563,7 @@ impl<S: Storage> Raft<S> {
         };
 
         self.make_response(m, MessageRPC::RequestVoteResp(vote_granted));
-        Some(self.return_ready())
-    }
-
-    fn step_follower(&mut self, m: &Message) -> Option<Ready> {
-        match m.body().variant {
-            MessageRPC::AppendEntries(ref args) => {
-                if m.term() < self.current_term {
-                    self.make_response(m, MessageRPC::AppendEntriesResp(false));
-                    return Some(self.return_ready());
-                }
-
-                // Handle the false check; namely, if the message is from a previous term
-                // or we fail the log consistency check.
-                if m.term() < self.current_term || !self.check_log_consistency(args) {
-                    self.make_response(m, MessageRPC::AppendEntriesResp(false));
-                    return Some(self.return_ready());
-                }
-
-                // Find the first index that conflicts with a new one (same index, different terms),
-                // replacing it and all that follows with the new entries.
-                let mut entries: Vec<Entry> = vec![];
-                if args.entries.len() > 0 {
-                    let mut start_i = args.entries.first().expect("Impossible").index as usize;
-                    for (arg_i, entry) in args.entries.iter().enumerate() {
-                        match self.storage.term(arg_i as u32) {
-                            Some(term) => {
-                                if term != entry.term {
-                                    start_i = arg_i;
-                                    break;
-                                }
-                            }
-                            _ => {
-                                start_i = arg_i;
-                                break;
-                            }
-                        }
-                    }
-                    entries = args.entries[start_i..].to_vec();
-                }
-
-                self.reset_election_timer();
-                self.next_entries = entries;
-                self.make_response(m, MessageRPC::AppendEntriesResp(true));
-                return Some(self.return_ready());
-            }
-
-            MessageRPC::RequestVote(ref args) => return self.handle_request_vote(m, args),
-
-            // Follower doesn't care about response messages.
-            _ => None,
-        }
-    }
-
-    fn step_candidate(&mut self, m: &Message) -> Option<Ready> {
-        match m.body().variant {
-            MessageRPC::AppendEntries(ref args) => {
-                // Duplication with step_follower
-                if m.body().term < self.current_term {
-                    self.make_response(m, MessageRPC::AppendEntriesResp(false));
-                    return Some(self.return_ready());
-                }
-
-                // Convert to follower.
-                self.become_follower(m.body().term);
-                // Handle AppendEntries same as follower.
-                None
-            }
-
-            MessageRPC::RequestVote(ref args) => {
-                // Handle RequestVote same as follower.
-                self.handle_request_vote(&m, args)
-            }
-
-            MessageRPC::RequestVoteResp(vote_granted) => {
-                // If response is not for a RequestVote RPC sent in this current election, then ignore.
-                if !self.msg_store.matches(&m) {
-                    return None;
-                }
-
-                // Otherwise, handle.
-                let election = self.election.get_or_insert(Election::new(&self));
-                election.apply_response(m.from(), vote_granted);
-                if election.has_quorum() {
-                    Some(self.become_leader())
-                } else {
-                    None
-                }
-            }
-
-            // Don't care about AppendEntriesResp
-            _ => None,
-        }
+        self.return_ready()
     }
 
     fn become_leader(&mut self) -> Ready {
@@ -665,46 +639,6 @@ impl<S: Storage> Raft<S> {
         self.return_ready()
     }
 
-    fn step_leader(&mut self, m: &Message) -> Option<Ready> {
-        match m.body().variant {
-            MessageRPC::AppendEntriesResp(success) => {
-                let peer_id = m.from();
-                let sent_msg = self.msg_store.get(peer_id, m.metadata().rpc_id)?;
-                if let MessageRPC::AppendEntries(args) = &sent_msg.body().variant {
-                    // If follower didn't have an entry matching prevLogIndex and prevLogTerm, decrement
-                    // its next_index and retry.
-                    if !success {
-                        let curr_next_index = *self
-                            .next_index
-                            .get(&peer_id)
-                            .expect("Should have next_index for all peers");
-                        self.next_index.insert(peer_id, curr_next_index - 1);
-                        self.make_append_entries(&[peer_id], None, false);
-                        Some(self.return_ready())
-                    }
-                    // Otherwise, update next_index and match_index, then check for quorum to
-                    // update commit index.
-                    else if args.entries.len() > 0 {
-                        let last_index = args.entries.last().unwrap().index;
-                        self.next_index.insert(peer_id, last_index + 1);
-                        self.match_index.insert(peer_id, last_index);
-                        if self.has_quorum(last_index) {
-                            self.commit_index = std::cmp::max(self.commit_index, last_index);
-                        }
-                        None
-                    }
-                    // Do nothing on heartbeat success.
-                    else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            }
-            _ => None,
-        }
-    }
-
     fn return_ready(&mut self) -> Ready {
         let mut messages = vec![];
         std::mem::swap(&mut messages, &mut self.next_messages);
@@ -742,5 +676,78 @@ impl<S: Storage> Raft<S> {
             .filter(|id| self.match_index.get(id).unwrap() >= &index)
             .count();
         cnt >= quorum
+    }
+}
+
+#[derive(Debug)]
+struct MsgStore {
+    /// Term for which this message store is valid.
+    term: u32,
+
+    /// Map of peer id's to rpc_id's.
+    sent: HashMap<(NodeId, u32), Message>,
+}
+
+impl MsgStore {
+    fn new() -> Self {
+        Self {
+            term: 0,
+            sent: HashMap::new(),
+        }
+    }
+
+    fn get(&self, node_id: NodeId, rpc_id: u32) -> Option<&Message> {
+        self.sent.get(&(node_id, rpc_id))
+    }
+
+    fn insert(&mut self, term: u32, msg: &mut Message) -> u32 {
+        if term > self.term {
+            self.term = term;
+            self.sent.clear();
+        }
+        // For now, just use a random id.
+        let rpc_id = rand::random();
+        msg.set_rpc_id(rpc_id);
+        self.sent.insert((msg.to(), rpc_id), msg.clone());
+        rpc_id
+    }
+
+    fn matches(&self, msg: &Message) -> bool {
+        if let Some(sent) = self.sent.get(&(msg.from(), msg.metadata().rpc_id)) {
+            sent.metadata().rpc_id == msg.metadata().rpc_id
+        } else {
+            false
+        }
+    }
+}
+
+#[derive(Debug)]
+struct Election {
+    // is term required?
+    // term: u32,
+    responded_peers: HashSet<NodeId>,
+    votes_received: u32,
+    quorum: u32,
+}
+
+impl Election {
+    fn new<S: Storage>(raft: &Raft<S>) -> Self {
+        Self {
+            // term: raft.current_term,
+            // Node always votes for itself.
+            votes_received: 1,
+            responded_peers: HashSet::<NodeId>::with_capacity(raft.peers.len()),
+            quorum: raft.peers.len() as u32 / 2 + 1,
+        }
+    }
+
+    fn has_quorum(&self) -> bool {
+        self.votes_received >= self.quorum
+    }
+
+    fn apply_response(&mut self, peer: NodeId, vote_granted: bool) {
+        if self.responded_peers.insert(peer) && vote_granted {
+            self.votes_received += 1;
+        }
     }
 }
