@@ -1,9 +1,11 @@
 use std::rc::Rc;
 
-use raft::Config;
-use raft::node::*;
+use assert_matches::assert_matches;
+
 use raft::message::*;
+use raft::node::*;
 use raft::storage::*;
+use raft::Config;
 
 const CLUSTER_SIZE: u32 = 3;
 const ELECTION_TIMEOUT: u32 = 10;
@@ -70,6 +72,7 @@ impl NodeTester {
         let rdy = nt
             .node
             .step(&msgs[msgs.len() - 1])
+            .unwrap()
             .expect("Should have Ready after quorum");
 
         (nt, rdy)
@@ -133,25 +136,33 @@ impl NodeTester {
         self.storage.append_entries(&mut rdy.entries);
     }
 
+    /// Sends a message to node (calls `node.step(m)`) with a success response to each
+    /// passed `Message`. Sends an AppendEntriesResp(true)
+    ///
+    /// Sends an `MessageRPC::AppendEntriesResp(true)` or `MessageRPC::RequestVoteResp(true)`
+    /// for each passed message if the node is a leader or candidate.
     fn respond_success(&mut self, messages: &[Message]) -> Vec<Ready> {
         assert!(self.node.state() != NodeState::FOLLOWER);
         let mut rdys: Vec<Ready> = vec![];
         for m in messages {
-            let rdy = self.node.step(&Message::new(
-                MessageBody {
-                    term: m.term(),
-                    variant: if self.node.state() == NodeState::CANDIDATE {
-                        MessageRPC::RequestVoteResp(true)
-                    } else {
-                        MessageRPC::AppendEntriesResp(true)
+            let rdy = self
+                .node
+                .step(&Message::new(
+                    MessageBody {
+                        term: m.term(),
+                        variant: if self.node.state() == NodeState::CANDIDATE {
+                            MessageRPC::RequestVoteResp(true)
+                        } else {
+                            MessageRPC::AppendEntriesResp(true)
+                        },
                     },
-                },
-                MessageMetadata {
-                    rpc_id: m.metadata().rpc_id,
-                    from: m.to(),
-                    to: m.from(),
-                },
-            ));
+                    MessageMetadata {
+                        rpc_id: m.metadata().rpc_id,
+                        from: m.to(),
+                        to: m.from(),
+                    },
+                ))
+                .unwrap();
             if let Some(rdy) = rdy {
                 rdys.push(rdy);
             }
@@ -162,7 +173,7 @@ impl NodeTester {
     fn tick_for(&mut self, times: u32) -> Vec<Ready> {
         let mut rdys: Vec<Option<Ready>> = vec![];
         for _ in 0..times {
-            rdys.push(self.node.tick());
+            rdys.push(self.node.tick().unwrap());
         }
         rdys.into_iter().filter_map(|v| v).collect()
     }
@@ -180,7 +191,11 @@ fn follower_starts_election_after_timeout() {
     let mut nt = NodeTester::new_initial_node();
 
     assert_eq!(nt.tick_for(ELECTION_TIMEOUT - 1).len(), 0);
-    let rdy = nt.node.tick().expect("Should have Ready after timeout");
+    let rdy = nt
+        .node
+        .tick()
+        .unwrap()
+        .expect("Should have Ready after timeout");
 
     nt.assert_election_started(&rdy, 1);
 }
@@ -190,7 +205,11 @@ fn candidate_starts_election_after_timeout() {
     let (mut nt, _) = NodeTester::new_candidate_node();
 
     assert_eq!(nt.tick_for(ELECTION_TIMEOUT - 1).len(), 0);
-    let rdy = nt.node.tick().expect("Should have Ready after timeout");
+    let rdy = nt
+        .node
+        .tick()
+        .unwrap()
+        .expect("Should have Ready after timeout");
 
     nt.assert_election_started(&rdy, 2);
 }
@@ -232,6 +251,7 @@ fn follower_with_no_logs_responds_to_heartbeat() {
     let rdy = nt
         .node
         .step(&heartbeat)
+        .unwrap()
         .expect("Should have Ready with AppendEntriesResp");
 
     assert_eq!(rdy.messages.len(), 1);
@@ -266,6 +286,7 @@ fn follower_with_no_logs_votes_for_candidate() {
     let rdy = nt
         .node
         .step(&reqvote)
+        .unwrap()
         .expect("Should have Ready with RequestVoteResp");
 
     assert_eq!(rdy.messages.len(), 1);
@@ -304,7 +325,7 @@ fn candidate_becomes_follower_on_msg_from_new_leader() {
             to: 0,
         },
     );
-    nt.node.step(&msg);
+    nt.node.step(&msg).unwrap();
     assert_eq!(nt.node.state(), NodeState::FOLLOWER);
 }
 
@@ -316,6 +337,7 @@ fn leader_sends_heartbeats_after_timeout() {
     let rdy = nt
         .node
         .tick()
+        .unwrap()
         .expect("Leader should have Ready after heartbeat timeout");
 
     assert_eq!(rdy.messages.len() as u32, CLUSTER_SIZE - 1);
@@ -359,8 +381,8 @@ fn all_servers_become_follower_on_msg_with_higher_term() {
         },
     );
 
-    nt_candidate.node.step(&msg);
-    nt_leader.node.step(&msg);
+    nt_candidate.node.step(&msg).unwrap();
+    nt_leader.node.step(&msg).unwrap();
     assert_eq!(nt_candidate.node.state(), NodeState::FOLLOWER);
     assert_eq!(nt_leader.node.state(), NodeState::FOLLOWER);
 }
@@ -371,7 +393,7 @@ fn leader_takes_client_command() {
     nt.persist_entries(&mut rdy);
 
     let test_cmd = "test".as_bytes().to_vec();
-    let rdy = nt.node.propose(test_cmd.clone()).unwrap();
+    let rdy = nt.node.propose(test_cmd.clone()).unwrap().unwrap();
 
     // Assert messages sent to peers. Send the noop and newly proposed command.
     assert_eq!(rdy.messages.len() as u32, CLUSTER_SIZE - 1);
@@ -423,7 +445,7 @@ fn leader_commits_command_on_quorum() {
     nt.persist_entries(&mut rdy);
 
     let test_cmd = "test".as_bytes().to_vec();
-    let mut rdy = nt.node.propose(test_cmd.clone()).unwrap();
+    let mut rdy = nt.node.propose(test_cmd.clone()).unwrap().unwrap();
     nt.persist_entries(&mut rdy);
 
     // Respond with AppendEntriesResp(true) just before quorum is reached.
@@ -464,4 +486,38 @@ fn leader_commits_command_on_quorum() {
 #[test]
 fn follower_updates_commit_index() {
     let (mut nt) = NodeTester::new_initial_node();
+}
+
+#[test]
+fn stopped_node_doesnt_accept_messages() {
+    let (mut nt_follower) = NodeTester::new_initial_node();
+    nt_follower.node.stop();
+
+    assert_matches!(
+        nt_follower.node.tick(),
+        Err(RaftError::NodeStopped)
+    );
+
+    let heartbeat = Message::new(
+        MessageBody {
+            term: 0,
+            variant: MessageRPC::AppendEntries(AppendEntriesArgs {
+                leader_id: 1,
+                prev_log_index: 0,
+                prev_log_term: 0,
+                entries: vec![],
+                leader_commit: 0,
+            }),
+        },
+        MessageMetadata {
+            rpc_id: 0,
+            from: 1,
+            to: 0,
+        },
+    );
+
+    assert_matches!(
+        nt_follower.node.step(&heartbeat),
+        Err(RaftError::NodeStopped)
+    );
 }

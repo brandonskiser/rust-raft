@@ -2,10 +2,10 @@ use std::collections::VecDeque;
 use std::fmt::Debug;
 use std::rc::Rc;
 
-use raft::Config;
-use raft::node::*;
 use raft::message::*;
+use raft::node::*;
 use raft::storage::*;
+use raft::Config;
 
 const NODE_IDS: [NodeId; 3] = [1, 2, 3];
 const ELECTION_TIMEOUT: u32 = 20;
@@ -78,7 +78,7 @@ impl Cluster {
             .servers
             .iter_mut()
             .filter_map(|s| {
-                if let Some(mut rdy) = s.node.tick() {
+                if let Ok(Some(mut rdy)) = s.node.tick() {
                     s.persist_entries(&mut rdy);
                     Some(rdy)
                 } else {
@@ -97,7 +97,7 @@ impl Cluster {
         while let Some(msg) = queue.pop_front() {
             let to = msg.to();
             println!("Sending message: {:?}", msg);
-            if let Some(mut rdy) = self.send_msg(msg) {
+            if let Ok(Some(mut rdy)) = self.send_msg(msg) {
                 println!("Post message rdy: {:?}", rdy);
                 self.get_server_mut(to).persist_entries(&mut rdy);
                 for m in rdy.messages {
@@ -109,7 +109,7 @@ impl Cluster {
 
     /// Calls `step(msg)` on the message's `to()` node. This method does NOT
     /// persist the log entries returned by the Ready `entries` vector.
-    fn send_msg(&mut self, msg: Message) -> Option<Ready> {
+    fn send_msg(&mut self, msg: Message) -> Result<Option<Ready>> {
         let to = self.get_server_mut(msg.to());
         to.node.step(&msg)
     }

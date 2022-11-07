@@ -8,6 +8,7 @@ use crate::message::*;
 use crate::storage::*;
 
 pub type NodeId = u32;
+pub type Result<T> = std::result::Result<T, RaftError>;
 
 /// `Command` represents the input a client applies to the state machine.
 pub type Command = Vec<u8>;
@@ -54,10 +55,42 @@ impl Entry {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub enum RaftError {
+    NotLeader,
+    NodeStopped,
+    InvalidMessage(&'static str),
+}
+
+impl std::fmt::Display for RaftError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match *self {
+            Self::NotLeader => {
+                write!(
+                    f,
+                    "NotLeader: node must be the leader to process this request"
+                )
+            }
+            Self::NodeStopped => {
+                write!(
+                    f,
+                    "NodeStopped: cannot process anything while node is stopped"
+                )
+            }
+            Self::InvalidMessage(msg) => {
+                write!(f, "InvalidMessage: {}", msg)
+            }
+        }
+    }
+}
+
+impl std::error::Error for RaftError {}
+
 /// Represents a single node participating in a Raft cluster.
 #[derive(Debug)]
 pub struct Node<S: Storage> {
     raft: Raft<S>,
+    stopped: bool,
 }
 
 impl<S: Storage> Node<S> {
@@ -65,6 +98,7 @@ impl<S: Storage> Node<S> {
         // TODO: validate cfg
         Node {
             raft: Raft::new(cfg),
+            stopped: false,
         }
     }
 
@@ -76,59 +110,66 @@ impl<S: Storage> Node<S> {
         self.raft.state
     }
 
-    pub fn tick(&mut self) -> Option<Ready> {
-        self.preprocess(None);
+    pub fn tick(&mut self) -> Result<Option<Ready>> {
+        self.preprocess(None)?;
 
         let rdy = match self.raft.state {
             NodeState::FOLLOWER => self.raft.tick_follower(),
             NodeState::CANDIDATE => self.raft.tick_candidate(),
             NodeState::LEADER => self.raft.tick_leader(),
         };
-        self.postprocess(rdy)
+        Ok(self.postprocess(rdy))
     }
 
-    pub fn step(&mut self, m: &Message) -> Option<Ready> {
-        self.preprocess(Some(m));
+    pub fn step(&mut self, m: &Message) -> Result<Option<Ready>> {
+        self.preprocess(Some(m))?;
 
         let rdy = match self.raft.state {
             NodeState::FOLLOWER => self.raft.step_follower(m),
             NodeState::CANDIDATE => self.raft.step_candidate(m),
             NodeState::LEADER => self.raft.step_leader(m),
         };
-        self.postprocess(rdy)
+        Ok(self.postprocess(rdy))
     }
 
-    /// TODO: Add error response. Need to add error responses for generally
-    /// all of Node/Raft.
-    pub fn propose(&mut self, command: Command) -> Option<Ready> {
+    pub fn propose(&mut self, command: Command) -> Result<Option<Ready>> {
         if self.state() != NodeState::LEADER {
-            None
+            Err(RaftError::NotLeader)
         } else {
-            Some(self.raft.propose(command))
+            Ok(Some(self.raft.propose(command)))
         }
     }
 
+    /// TODO: Should prevent sending new `Ready`'s until advance is called.
+    /// This is to ensure the validity of internal state (e.g. commitIndex)
+    /// in the event that the client fails to persist log entries.
     pub fn advance(&mut self) {
         unimplemented!()
     }
 
-    pub fn send(&self) -> () {
-        unimplemented!()
+    /// Calling `stop` will return a `RaftError::NodeStopped` error on any
+    /// calls to `tick` or `step`.
+    pub fn stop(&mut self) -> () {
+        self.stopped = true;
     }
 
-    pub fn stop(&self) -> () {
-        unimplemented!()
-    }
-
-    fn preprocess(&mut self, msg: Option<&Message>) {
-        if let Some(msg) = msg {
+    fn preprocess(&mut self, msg: Option<&Message>) -> Result<()> {
+        if self.stopped {
+            return Err(RaftError::NodeStopped);
+        } else if let Some(msg) = msg {
+            // 1. Validate message
             if msg.from() == self.id() {
-                panic!("Node cannot process message to itself: {:?}", msg);
+                return Err(RaftError::InvalidMessage(
+                    "node cannot process its own message",
+                ));
             }
+            // From the Raft paper: if RPC request or response contains term
+            // T > currentTerm: set currentTerm = T, convert to follower.
             if msg.term() > self.raft.current_term {
                 self.raft.become_follower(msg.term());
             }
         }
+        Ok(())
     }
 
     fn postprocess(&mut self, rdy: Option<Ready>) -> Option<Ready> {
@@ -705,7 +746,7 @@ impl MsgStore {
             self.term = term;
             self.sent.clear();
         }
-        // For now, just use a random id.
+        // TODO: Use better rpc_id generation. For now, just use a random id.
         let rpc_id = rand::random();
         msg.set_rpc_id(rpc_id);
         self.sent.insert((msg.to(), rpc_id), msg.clone());
