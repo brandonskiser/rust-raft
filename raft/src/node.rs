@@ -301,46 +301,7 @@ impl<S: Storage> Raft<S> {
 
     fn step_follower(&mut self, m: &Message) -> Option<Ready> {
         match m.body().variant {
-            MessageRPC::AppendEntries(ref args) => {
-                if m.term() < self.current_term {
-                    self.make_response(m, MessageRPC::AppendEntriesResp(false));
-                    return Some(self.return_ready());
-                }
-
-                // Handle the false check; namely, if the message is from a previous term
-                // or we fail the log consistency check.
-                if m.term() < self.current_term || !self.check_log_consistency(args) {
-                    self.make_response(m, MessageRPC::AppendEntriesResp(false));
-                    return Some(self.return_ready());
-                }
-
-                // Find the first index that conflicts with a new one (same index, different terms),
-                // replacing it and all that follows with the new entries.
-                let mut entries: Vec<Entry> = vec![];
-                if args.entries.len() > 0 {
-                    let mut start_i = args.entries.first().expect("Impossible").index as usize;
-                    for (arg_i, entry) in args.entries.iter().enumerate() {
-                        match self.storage.term(arg_i as u32) {
-                            Some(term) => {
-                                if term != entry.term {
-                                    start_i = arg_i;
-                                    break;
-                                }
-                            }
-                            _ => {
-                                start_i = arg_i;
-                                break;
-                            }
-                        }
-                    }
-                    entries = args.entries[start_i..].to_vec();
-                }
-
-                self.reset_election_timer();
-                self.next_entries = entries;
-                self.make_response(m, MessageRPC::AppendEntriesResp(true));
-                return Some(self.return_ready());
-            }
+            MessageRPC::AppendEntries(ref args) => Some(self.handle_append_entries(&m, &args)),
 
             MessageRPC::RequestVote(ref args) => return Some(self.handle_request_vote(m, args)),
 
@@ -543,6 +504,15 @@ impl<S: Storage> Raft<S> {
         if m.term() < self.current_term || !self.check_log_consistency(args) {
             self.make_response(m, MessageRPC::AppendEntriesResp(false));
             return self.return_ready();
+        }
+
+        // Handle step 5 - If leaderCommit > commitIndex, set commitIndex to
+        // min(leaderCommit, index of last new entry).
+        // 
+        // TODO: Unsure of this step, should check if this is correct. Leaving
+        // this conditional for now.
+        if args.leader_commit > self.commit_index {
+            self.commit_index = args.leader_commit;
         }
 
         // Find the first index that conflicts with a new one (same index, different terms),

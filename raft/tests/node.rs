@@ -67,7 +67,7 @@ impl NodeTester {
             })
             .collect::<Vec<_>>();
         for m in msgs[0..msgs.len() - 1].iter() {
-            nt.node.step(m);
+            nt.node.step(m).unwrap();
         }
         let rdy = nt
             .node
@@ -137,7 +137,7 @@ impl NodeTester {
     }
 
     /// Sends a message to node (calls `node.step(m)`) with a success response to each
-    /// passed `Message`. Sends an AppendEntriesResp(true)
+    /// passed `Message`.
     ///
     /// Sends an `MessageRPC::AppendEntriesResp(true)` or `MessageRPC::RequestVoteResp(true)`
     /// for each passed message if the node is a leader or candidate.
@@ -485,18 +485,101 @@ fn leader_commits_command_on_quorum() {
 
 #[test]
 fn follower_updates_commit_index() {
-    let (mut nt) = NodeTester::new_initial_node();
+    let mut nt = NodeTester::new_initial_node();
+
+    // First, send an AppendEntries with a log.
+    let test_cmd = "test".as_bytes().to_vec();
+    let msg = Message::new(
+        MessageBody {
+            term: 1,
+            variant: MessageRPC::AppendEntries(AppendEntriesArgs {
+                leader_id: 1,
+                prev_log_index: 0,
+                prev_log_term: 0,
+                entries: vec![Entry {
+                    term: 1,
+                    index: 1,
+                    noop: false,
+                    data: test_cmd.clone(),
+                }],
+                leader_commit: 0,
+            }),
+        },
+        MessageMetadata {
+            rpc_id: 1,
+            from: 1,
+            to: 0,
+        },
+    );
+
+    let mut rdy = nt
+        .node
+        .step(&msg)
+        .unwrap()
+        .expect("Should have Ready after AppendEntries");
+    assert_eq!(
+        rdy.entries,
+        vec![Entry {
+            term: 1,
+            index: 1,
+            noop: false,
+            data: test_cmd.clone(),
+        }],
+        "entries should have one entry. Got Ready {:?}",
+        rdy
+    );
+    nt.persist_entries(&mut rdy); // Persist to Memory storage.
+
+    // Send an AppendEntries with the leader_commit updated.
+    let msg = Message::new(
+        MessageBody {
+            term: 1,
+            variant: MessageRPC::AppendEntries(AppendEntriesArgs {
+                leader_id: 1,
+                prev_log_index: 0,
+                prev_log_term: 0,
+                entries: vec![],
+                leader_commit: 1,
+            }),
+        },
+        MessageMetadata {
+            rpc_id: 1,
+            from: 1,
+            to: 0,
+        },
+    );
+
+    let rdy = nt
+        .node
+        .step(&msg)
+        .unwrap()
+        .expect("Should have Ready after AppendEntries");
+    assert_eq!(
+        rdy.messages[0].body(),
+        &MessageBody {
+            term: 1,
+            variant: MessageRPC::AppendEntriesResp(true)
+        }
+    );
+    assert_eq!(
+        rdy.committed_entries,
+        vec![Entry {
+            term: 1,
+            index: 1,
+            noop: false,
+            data: test_cmd,
+        }],
+        "committed_entries should have one entry. Got Ready: {:?}",
+        rdy
+    );
 }
 
 #[test]
 fn stopped_node_doesnt_accept_messages() {
-    let (mut nt_follower) = NodeTester::new_initial_node();
+    let mut nt_follower = NodeTester::new_initial_node();
     nt_follower.node.stop();
 
-    assert_matches!(
-        nt_follower.node.tick(),
-        Err(RaftError::NodeStopped)
-    );
+    assert_matches!(nt_follower.node.tick(), Err(RaftError::NodeStopped));
 
     let heartbeat = Message::new(
         MessageBody {
